@@ -1,0 +1,4 @@
+{
+  "default_strategy": "clarity",
+  "output_format": "json"
+}
