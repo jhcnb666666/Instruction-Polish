@@ -24,6 +24,31 @@ VALID_DIRECTIONS = {
     "around",
 }
 
+VALID_RELATIONS = {
+    "near",
+    "in_front_of",
+    "behind",
+    "left_of",
+    "right_of",
+    "left_of_agent",
+    "right_of_agent",
+    "inside",
+    "into",
+    "outside",
+    "through",
+    "along",
+    "toward",
+    "away_from",
+    "at",
+    "between",
+    "end_of",
+    "past",
+    "before",
+    "just_before",
+    "before_hitting",
+    "after",
+}
+
 VALID_STATUSES = {"ok", "needs_review", "unsupported", "none"}
 
 VALID_FEATURE_ROLES = {
@@ -156,8 +181,11 @@ def _validate_feature(feature: Dict[str, Any]) -> None:
         if not feature.get("landmark"):
             raise ValueError(f"Feature with role '{role}' must have a landmark")
     else:
-        if not feature.get("relation"):
+        relation = feature.get("relation")
+        if not relation:
             raise ValueError(f"Feature with role '{role}' must have a relation")
+        if relation not in VALID_RELATIONS:
+            raise ValueError(f"Invalid relation '{relation}' for feature role '{role}'")
         if not feature.get("landmark"):
             raise ValueError(f"Feature with role '{role}' must have a landmark")
 

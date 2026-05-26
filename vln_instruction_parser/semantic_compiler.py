@@ -33,6 +33,31 @@ VALID_DIRECTIONS = {
     "around",
 }
 
+VALID_RELATIONS = {
+    "near",
+    "in_front_of",
+    "behind",
+    "left_of",
+    "right_of",
+    "left_of_agent",
+    "right_of_agent",
+    "inside",
+    "into",
+    "outside",
+    "through",
+    "along",
+    "toward",
+    "away_from",
+    "at",
+    "between",
+    "end_of",
+    "past",
+    "before",
+    "just_before",
+    "before_hitting",
+    "after",
+}
+
 
 def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -49,7 +74,7 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     8. Detect unsupported vertical motion.
     """
     if not isinstance(draft, dict):
-        return _unsupported("invalid_draft")
+        return _invalid_draft("invalid_draft")
 
     actions = draft.get("actions", [])
     order = draft.get("order", [])
@@ -57,7 +82,7 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     constraints_raw = draft.get("constraints", [])
 
     if not isinstance(actions, list):
-        return _unsupported("invalid_draft")
+        return _invalid_draft("invalid_draft")
 
     # Auto-assign ids if missing
     for i, a in enumerate(actions):
@@ -69,16 +94,28 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     for a in actions:
         aid = a.get("id")
         if not aid or aid in ids:
-            return _unsupported("duplicate_or_missing_action_id")
+            return _invalid_draft("duplicate_or_missing_action_id")
         ids.add(aid)
 
-    # 2. Validate features — skip unknown roles rather than failing entirely
+    # Validate actions and directions before anything else
+    for a in actions:
+        act = a.get("action", "")
+        if act and act not in VALID_ACTIONS:
+            return _invalid_draft(f"invalid_action:{act}")
+        direction = a.get("direction")
+        if direction is not None and direction not in VALID_DIRECTIONS:
+            return _invalid_draft(f"invalid_direction:{direction}")
+
+    # 2. Validate features — skip unknown roles/relations rather than failing entirely
     for a in actions:
         valid_features = []
         for f in a.get("features", []):
             role = f.get("role")
             if role not in VALID_FEATURE_ROLES:
-                # Silently skip unknown roles (prompt drift)
+                continue
+            relation = f.get("relation")
+            if relation is not None and relation not in VALID_RELATIONS:
+                # Skip features with invalid relations
                 continue
             if role in ("terminate", "start"):
                 if not f.get("trigger") or not f.get("landmark"):
@@ -114,9 +151,12 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     constraints: List[Dict[str, Any]] = []
     for cr in constraints_raw:
         if cr.get("type") == "forbidden_action":
+            action = cr.get("action", "UNKNOWN")
+            if action not in VALID_ACTIONS:
+                return _invalid_draft(f"invalid_constraint_action:{action}")
             constraint: Dict[str, Any] = {
                 "type": "forbidden_action",
-                "action": cr.get("action", "UNKNOWN"),
+                "action": action,
                 "features": _normalize_features(cr.get("features", [])),
             }
             if cr.get("direction"):
@@ -147,7 +187,7 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     # Check for UNKNOWN actions in the final plan
     for t in tasks:
         if t.get("action") == "UNKNOWN":
-            return _unsupported("unknown_action_in_plan")
+            return _invalid_draft("unknown_action_in_plan")
 
     # Build result
     result: Dict[str, Any] = {
@@ -157,6 +197,16 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         "constraints": constraints,
     }
     return result
+
+
+def _invalid_draft(reason: str) -> Dict[str, Any]:
+    return {
+        "status": "needs_review",
+        "confidence": 0.0,
+        "tasks": [],
+        "constraints": [],
+        "reason": reason,
+    }
 
 
 def _unsupported(reason: str) -> Dict[str, Any]:
@@ -219,8 +269,8 @@ def _topological_sort(actions: List[Dict[str, Any]], order: List[Dict[str, Any]]
                 queue.append(neighbor)
 
     if len(result) != len(actions):
-        # Cycle detected; return needs_review with empty tasks
-        return _unsupported("cyclic_execution_order")
+        # Cycle detected; return invalid_draft
+        return _invalid_draft("cyclic_execution_order")
 
     return result
 
