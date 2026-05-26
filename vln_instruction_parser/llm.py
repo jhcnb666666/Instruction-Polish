@@ -357,6 +357,13 @@ def verify_candidate_plans(
 
     if not out:
         return None
+
+    # Must contain exactly all input candidate_ids
+    if seen_ids != valid_ids:
+        return None
+
+    # Sort by confidence descending (stable)
+    out.sort(key=lambda x: x["confidence"], reverse=True)
     return out
 
 
@@ -502,8 +509,10 @@ def _generate_generic(
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return response
+    # Decode only the newly generated tokens
+    generated_ids = outputs[:, inputs.input_ids.shape[1]:]
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return response.strip()
 
 
 def _call_local(

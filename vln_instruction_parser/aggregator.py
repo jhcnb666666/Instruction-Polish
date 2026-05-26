@@ -1,10 +1,9 @@
 """Vote aggregation logic for LLM-based VLN parsing — compact plan aggregation."""
 
 import json
-from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
-from .semantic_compiler import compile_draft
+from .semantic_compiler import compile_draft, VALID_ACTIONS, VALID_DIRECTIONS
 
 
 def normalize_landmark(landmark: str) -> str:
@@ -12,27 +11,51 @@ def normalize_landmark(landmark: str) -> str:
     return " ".join(landmark.lower().split())
 
 
+def _task_signature(task: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Create a task signature for clustering, normalizing feature order."""
+    features = task.get("features", [])
+    # Sort features by their content to make signature order-independent
+    feature_sigs = tuple(
+        sorted(
+            (
+                f.get("role"),
+                f.get("relation"),
+                normalize_landmark(f.get("landmark", "")),
+                f.get("trigger"),
+            )
+            for f in features
+        )
+    )
+    return (
+        task.get("action", "UNKNOWN"),
+        task.get("direction"),
+        feature_sigs,
+    )
+
+
 def _plan_signature(plan: Dict[str, Any]) -> Tuple[Any, ...]:
     """Create a full plan signature for clustering."""
     tasks = plan.get("tasks", [])
-    task_sigs = tuple(
-        (
-            t.get("action", "UNKNOWN"),
-            t.get("direction"),
-            tuple(
-                (f.get("role"), f.get("relation"), normalize_landmark(f.get("landmark", "")), f.get("trigger"))
-                for f in t.get("features", [])
-            ),
-        )
-        for t in tasks
-    )
+    task_sigs = tuple(_task_signature(t) for t in tasks)
     constraints = tuple(sorted(json.dumps(c, sort_keys=True) for c in plan.get("constraints", [])))
     return (task_sigs, constraints)
 
 
-def _action_sequence(plan: Dict[str, Any]) -> List[str]:
-    """Extract just the action sequence from a plan."""
-    return [t.get("action", "UNKNOWN") for t in plan.get("tasks", [])]
+def _is_valid_executable_plan(plan: Dict[str, Any]) -> bool:
+    """Check if a compiled plan is a valid executable candidate."""
+    if plan.get("status") != "ok":
+        return False
+    tasks = plan.get("tasks", [])
+    if not tasks:
+        return False
+    for t in tasks:
+        action = t.get("action", "UNKNOWN")
+        if action == "UNKNOWN" or action not in VALID_ACTIONS:
+            return False
+        direction = t.get("direction")
+        if direction is not None and direction not in VALID_DIRECTIONS:
+            return False
+    return True
 
 
 def aggregate_votes(
@@ -44,7 +67,7 @@ def aggregate_votes(
 
     Strategy:
     1. Compile each draft into a compact plan.
-    2. Group plans by their full plan signature (tasks + constraints).
+    2. Group valid executable plans by their full plan signature.
     3. Keep top-3 different compact plans, each with candidate_id and vote_support.
 
     Returns:
@@ -58,12 +81,13 @@ def aggregate_votes(
 
     # Compile drafts to compact plans
     compiled_plans: List[Dict[str, Any]] = []
+    invalid_votes_seen = False
     for vote in raw_votes:
         plan = compile_draft(vote)
-        # Skip unsupported plans from compilation; they don't form viable candidates
-        if plan.get("status") == "unsupported":
-            continue
-        compiled_plans.append(plan)
+        if _is_valid_executable_plan(plan):
+            compiled_plans.append(plan)
+        else:
+            invalid_votes_seen = True
 
     if not compiled_plans:
         return []
@@ -90,6 +114,9 @@ def aggregate_votes(
         }
         if representative.get("reason") is not None:
             candidate["reason"] = representative["reason"]
+        # Flag if any invalid votes were filtered in this round
+        if invalid_votes_seen:
+            candidate["_invalid_votes_seen"] = True
         ranked.append(candidate)
 
     return ranked
