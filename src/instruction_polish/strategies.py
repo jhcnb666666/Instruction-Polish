@@ -1,12 +1,12 @@
 """Built-in polishing strategies."""
 
 import re
-from typing import Callable
+from typing import Callable, Dict, List
 
 Strategy = Callable[[str], str]
 
 # Global registry
-_STRATEGIES: dict[str, Strategy] = {}
+_STRATEGIES: Dict[str, Strategy] = {}
 
 
 def register_strategy(name: str, strategy: Strategy) -> None:
@@ -21,7 +21,7 @@ def get_strategy(name: str) -> Strategy:
     return _STRATEGIES[name]
 
 
-def list_registered_strategies() -> list[str]:
+def list_registered_strategies() -> List[str]:
     """List all registered strategy names."""
     return list(_STRATEGIES.keys())
 
@@ -65,8 +65,8 @@ def strategy_clarity(instruction: str) -> str:
     for pattern, repl in replacements.items():
         result = re.sub(pattern, repl, result, flags=re.IGNORECASE)
 
-    # Clean up leftover punctuation / spacing at start
-    result = re.sub(r"^[^a-zA-Z0-9]+", "", result).strip()
+    # Clean up leftover punctuation / spacing at start (preserve non-ASCII)
+    result = re.sub(r"^[\s\-–—.,;:!?]+", "", result).strip()
 
     # Capitalize first letter
     if result:
@@ -93,9 +93,10 @@ def strategy_conciseness(instruction: str) -> str:
 def strategy_detail(instruction: str) -> str:
     """Add structure and request for detail."""
     result = instruction.strip()
+    if not result:
+        return _ensure_punctuation(result)
     # Normalize capitalization first
-    if result:
-        result = result[0].upper() + result[1:]
+    result = result[0].upper() + result[1:]
     if not result.lower().startswith("please"):
         # Use comma for better flow if result starts with a prepositional phrase
         if result.lower().startswith(("in ", "on ", "at ", "to ", "for ", "with ")):
@@ -110,9 +111,15 @@ def strategy_detail(instruction: str) -> str:
 def strategy_roleplay(instruction: str) -> str:
     """Wrap instruction in a role-play context."""
     result = instruction.strip()
+    if not result:
+        return _ensure_punctuation(result)
     if "act as" not in result.lower() and "you are" not in result.lower():
         result = f"Act as an expert assistant. {result[0].upper()}{result[1:]}"
     return _ensure_punctuation(result)
+
+
+# Built-in strategy names for auto-selection (does not include user-registered custom strategies)
+_BUILTIN_STRATEGY_NAMES = ["default", "clarity", "conciseness", "detail", "roleplay"]
 
 
 def strategy_auto(instruction: str) -> str:
@@ -120,8 +127,9 @@ def strategy_auto(instruction: str) -> str:
     from .scoring import score_instruction
 
     candidates = []
-    for name, fn in _STRATEGIES.items():
-        if name == "auto":
+    for name in _BUILTIN_STRATEGY_NAMES:
+        fn = _STRATEGIES.get(name)
+        if fn is None or name == "auto":
             continue
         try:
             polished = fn(instruction)

@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 DEFAULT_CONFIG = {
     "default_strategy": "default",
@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def load_config(path: str | None = None) -> dict[str, Any]:
+def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     """Load JSON config from path or return defaults."""
     if path is None:
         # Look for config in current directory

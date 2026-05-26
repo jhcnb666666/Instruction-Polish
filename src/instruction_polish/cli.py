@@ -131,7 +131,10 @@ def main():
             fromfile="original",
             tofile="polished",
         )
-        print("".join(diff), end="")
+        diff_text = "".join(diff)
+        sys.stdout.write(diff_text)
+        if diff_text and not diff_text.endswith("\n"):
+            sys.stdout.write("\n")
     else:
         print(polished)
 

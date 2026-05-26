@@ -38,7 +38,7 @@ def score_instruction(instruction: str) -> Dict[str, Any]:
         "write", "generate", "create", "analyze", "evaluate", "solve",
         "calculate", "translate", "convert", "find", "identify",
     ]
-    has_action = any(v in lower for v in action_verbs)
+    has_action = any(re.search(r"\b" + re.escape(v) + r"\b", lower) for v in action_verbs)
     if has_action:
         score += 10
         reasons.append("contains action verb")
@@ -79,8 +79,8 @@ def score_instruction(instruction: str) -> Dict[str, Any]:
         reasons.append("missing capital letter")
 
     # Informal abbreviations
-    informal = ["u ", "ur ", "wanna", "gonna", "dunno", "gimme", "kinda"]
-    informal_count = sum(1 for w in informal if w in lower)
+    informal = ["u", "ur", "wanna", "gonna", "dunno", "gimme", "kinda"]
+    informal_count = sum(1 for w in informal if re.search(r"\b" + re.escape(w) + r"\b", lower))
     if informal_count:
         score -= informal_count * 5
         reasons.append(f"contains {informal_count} informal abbreviation(s)")

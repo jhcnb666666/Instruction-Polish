@@ -1,6 +1,6 @@
 """Core logic for instruction polishing."""
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from .strategies import list_registered_strategies, get_strategy
 from .scoring import score_instruction
@@ -9,7 +9,7 @@ from .utils import setup_logging
 logger = setup_logging()
 
 
-def list_strategies() -> list[str]:
+def list_strategies() -> List[str]:
     """Return available strategy names."""
     return list_registered_strategies()
 
