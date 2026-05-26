@@ -54,12 +54,33 @@ class TestComplexityDetection:
 
 class TestParseInstructionAuto:
     @patch("vln_instruction_parser.parser.parse_instruction_llm")
-    def test_routes_simple_to_rule(self, mock_llm):
-        """Simple instructions should use rule parser."""
+    def test_routes_simple_to_llm(self, mock_llm):
+        """Simple instructions now go through LLM-first pipeline."""
+        mock_llm.return_value = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [],
+            "constraints": [],
+            "alternatives": [],
+        }
         result = parse_instruction_auto("Turn left.")
-        mock_llm.assert_not_called()
+        mock_llm.assert_called_once()
         assert result["status"] == "ok"
-        assert result["confidence"] == 1.0
+
+    @patch("vln_instruction_parser.parser.parse_instruction_llm")
+    def test_llm_result_passed_through(self, mock_llm):
+        """parse_instruction_auto returns whatever parse_instruction_llm returns."""
+        mock_llm.return_value = {
+            "status": "needs_review",
+            "confidence": 0.87,
+            "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85}],
+            "constraints": [],
+            "alternatives": [],
+        }
+        result = parse_instruction_auto("Turn left.")
+        mock_llm.assert_called_once()
+        assert result["status"] == "needs_review"
+        assert result["confidence"] == 0.87
 
     @patch("vln_instruction_parser.parser.parse_instruction_llm")
     def test_routes_complex_to_llm(self, mock_llm):

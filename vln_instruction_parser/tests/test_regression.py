@@ -94,14 +94,12 @@ class TestSequenceConflict:
             _task(2, "TURN", "left", [{"role": "where", "relation": "at", "landmark": "sofa"}]),
         ])
         from vln_instruction_parser.aggregator import aggregate_votes
-        success, result, needs_adj = aggregate_votes(
-            [vote_a, vote_b, vote_c], "test"
-        )
-        # 2/3 agree on one sequence, so it wins and no adjudication needed
-        assert needs_adj is False
-        assert success is True
+        ranked = aggregate_votes([vote_a, vote_b, vote_c], "test")
+        # 2/3 agree on one sequence, so it is the top candidate
+        assert len(ranked) >= 1
+        assert ranked[0]["vote_support"] == 2
 
-    def test_turn_swapped_directions_triggers_adjudication_when_split(self):
+    def test_turn_swapped_directions_keeps_all_candidates(self):
         vote_a = _wrap([
             _task(1, "TURN", "left", [{"role": "where", "relation": "at", "landmark": "sofa"}]),
             _task(2, "TURN", "right", [{"role": "where", "relation": "at", "landmark": "door"}]),
@@ -115,11 +113,9 @@ class TestSequenceConflict:
             _task(2, "TURN", "right", [{"role": "where", "relation": "at", "landmark": "door"}]),
         ])
         from vln_instruction_parser.aggregator import aggregate_votes
-        success, result, needs_adj = aggregate_votes(
-            [vote_a, vote_b, vote_c], "test"
-        )
-        assert needs_adj is True
-        assert success is False
+        ranked = aggregate_votes([vote_a, vote_b, vote_c], "test")
+        # All three votes are different plans, so all three are kept
+        assert len(ranked) == 3
 
 
 class TestNormalizations:
