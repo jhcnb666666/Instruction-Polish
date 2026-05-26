@@ -2,7 +2,12 @@
 
 from typing import Any, Dict, List, Optional
 
-from .segmenter import segment_instruction, normalize_whitespace
+from .segmenter import (
+    segment_instruction,
+    normalize_whitespace,
+    split_sentences_for_llm,
+    has_cross_sentence_dependency,
+)
 from .extractor import extract_candidates
 from .resolver import resolve_context_for_candidates, update_context
 from .validator import validate_result
@@ -108,8 +113,14 @@ def parse_instruction_auto(
 
     Simple and complex instructions both go through the LLM semantic pipeline
     to receive uniform confidence/alternatives handling.
+
+    Multi-sentence instructions are split sentence-by-sentence when no
+    cross-sentence dependencies are detected; otherwise parsed as a whole
+    with a needs_review marker.
     """
     cleaned_text = normalize_whitespace(text)
+
+    # Pre-flight gates (MUST NOT depend on LLM)
     if not cleaned_text or not any(c.isalpha() and ord(c) < 128 for c in cleaned_text):
         result = _make_compact_result(
             status="ok",
@@ -121,47 +132,100 @@ def parse_instruction_auto(
         validate_result(result)
         return result
 
-    return parse_instruction_llm(
-        text,
-        fallback_to_rules=True,
-        vote_count=vote_count,
-        base_url=base_url,
-        model=model,
-        temperature=temperature,
-    )
+    from .complexity import has_active_vertical_motion
+    if has_active_vertical_motion(cleaned_text):
+        return _make_compact_result(
+            status="unsupported",
+            confidence=1.0,
+            tasks=[],
+            constraints=[],
+            alternatives=[],
+            reason="vertical_motion_not_supported",
+        )
+
+    sentences = split_sentences_for_llm(cleaned_text)
+
+    # Cross-sentence dependency check
+    has_dep, dep_reason = has_cross_sentence_dependency(sentences)
+    if has_dep:
+        result = parse_instruction_llm(
+            text,
+            fallback_to_rules=True,
+            vote_count=vote_count,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+        )
+        # Force downgrade to needs_review because cross-sentence anaphora
+        # makes per-sentence parsing unsafe
+        result["status"] = "needs_review"
+        result["reason"] = "cross_sentence_dependency_requires_review"
+        if result.get("confidence", 0.0) > 0.9:
+            result["confidence"] = 0.9
+        return result
+
+    # Single sentence: direct LLM parse
+    if len(sentences) <= 1:
+        return parse_instruction_llm(
+            text,
+            fallback_to_rules=True,
+            vote_count=vote_count,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+        )
+
+    # Multi-sentence without dependencies: parse each independently
+    max_chunks = _max_sentence_chunks()
+    if len(sentences) > max_chunks:
+        return _make_compact_result(
+            status="needs_review",
+            confidence=0.0,
+            tasks=[],
+            constraints=[],
+            alternatives=[],
+            reason="sentence_chunk_limit_exceeded",
+        )
+
+    sentence_results: List[Dict[str, Any]] = []
+    for sent in sentences:
+        r = _parse_single_sentence_llm(
+            sent,
+            vote_count=vote_count,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+        )
+        sentence_results.append(r)
+
+    merged = _merge_sentence_results(sentence_results, cleaned_text)
+    return merged
 
 
-def parse_instruction_llm(
+def _max_sentence_chunks() -> int:
+    import os
+    env_val = os.environ.get("VLN_MAX_SENTENCE_CHUNKS")
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except ValueError:
+            pass
+    return 8
+
+
+def _parse_single_sentence_llm(
     text: str,
-    fallback_to_rules: bool = True,
     vote_count: Optional[int] = None,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
     temperature: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Parse an English 2D VLN instruction using an LLM with semantic execution-order understanding.
+    Parse a single sentence via LLM vote → aggregate → verify → policy.
 
-    Flow:
-    1. Vote -> compile drafts -> group into top-3 candidates
-    2. Verifier ranks candidates with plan-level confidence
-    3. Apply confidence policy with 0.95/0.90 thresholds
-    4. Validate and return compact result
+    No pre-flight checks (caller already gated). No rule fallback.
     """
     from . import llm, aggregator
-    from .complexity import requires_semantic_parser
-
-    cleaned_text = normalize_whitespace(text)
-    if not cleaned_text or not any(c.isalpha() and ord(c) < 128 for c in cleaned_text):
-        result = _make_compact_result(
-            status="ok",
-            confidence=1.0,
-            tasks=[],
-            constraints=[],
-            alternatives=[],
-        )
-        validate_result(result)
-        return result
 
     success, raw_votes = llm.parse_with_llm(
         instruction=text,
@@ -172,40 +236,32 @@ def parse_instruction_llm(
     )
 
     if not success:
-        if fallback_to_rules:
-            return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
             confidence=0.0,
             tasks=[],
             constraints=[],
             alternatives=[],
-            reason="llm_unavailable_for_complex_instruction",
+            reason="sentence_chunk_unparsed",
         )
 
-    # Step 1: aggregate votes into top-3 compact candidates
     candidates = aggregator.aggregate_votes(raw_votes, text)
-
     if not candidates:
-        if fallback_to_rules:
-            return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
             confidence=0.0,
             tasks=[],
             constraints=[],
             alternatives=[],
-            reason="llm_aggregation_failed",
+            reason="sentence_chunk_unparsed",
         )
 
-    # Step 2: verifier reranker
     verifier_result = llm.verify_candidate_plans(
         text, candidates,
         base_url=base_url, model=model,
     )
 
     if verifier_result is not None:
-        # Map verifier confidence back to candidates
         ranked_plans = []
         for item in verifier_result:
             cid = item["candidate_id"]
@@ -232,7 +288,6 @@ def parse_instruction_llm(
             alternatives=[],
             reason="confidence_verification_unavailable",
         )
-        # Add up to two remaining candidates as alternatives with confidence 0.0
         for idx, alt in enumerate(candidates[1:3], start=2):
             result["alternatives"].append({
                 "rank": idx,
@@ -243,48 +298,84 @@ def parse_instruction_llm(
         try:
             validate_result(result)
         except ValueError:
-            if fallback_to_rules:
-                return parse_instruction(text)
             return _make_compact_result(
                 status="needs_review",
                 confidence=0.0,
                 tasks=[],
                 constraints=[],
                 alternatives=[],
-                reason="llm_validation_failed",
+                reason="sentence_chunk_requires_review",
             )
         return result
 
     if not ranked_plans:
-        if fallback_to_rules:
-            return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
             confidence=0.0,
             tasks=[],
             constraints=[],
             alternatives=[],
-            reason="llm_aggregation_failed",
+            reason="sentence_chunk_unparsed",
         )
 
-    # Step 3: apply confidence policy
     final = apply_plan_confidence_policy(ranked_plans)
 
     try:
         validate_result(final)
     except ValueError:
-        if fallback_to_rules:
-            return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
             confidence=0.0,
             tasks=[],
             constraints=[],
             alternatives=[],
-            reason="llm_validation_failed",
+            reason="sentence_chunk_requires_review",
         )
 
     return final
+
+
+def parse_instruction_llm(
+    text: str,
+    fallback_to_rules: bool = True,
+    vote_count: Optional[int] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Parse an English 2D VLN instruction using an LLM with semantic execution-order understanding.
+
+    Flow:
+    1. Vote -> compile drafts -> group into top-3 candidates
+    2. Verifier ranks candidates with plan-level confidence
+    3. Apply confidence policy with 0.95/0.90 thresholds
+    4. Validate and return compact result
+    """
+    cleaned_text = normalize_whitespace(text)
+    if not cleaned_text or not any(c.isalpha() and ord(c) < 128 for c in cleaned_text):
+        result = _make_compact_result(
+            status="ok",
+            confidence=1.0,
+            tasks=[],
+            constraints=[],
+            alternatives=[],
+        )
+        validate_result(result)
+        return result
+
+    result = _parse_single_sentence_llm(
+        text,
+        vote_count=vote_count,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+    )
+
+    if result["status"] in ("needs_review", "unsupported", "none") and fallback_to_rules:
+        return parse_instruction(text)
+
+    return result
 
 
 def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -383,6 +474,169 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
 
     base["alternatives"] = alternatives
     return base
+
+
+def _merge_sentence_results(
+    sentence_results: List[Dict[str, Any]],
+    original_text: str,
+) -> Dict[str, Any]:
+    """
+    Merge per-sentence compact results into a single multi-sentence compact result.
+
+    Rules:
+    - Status propagation: unsupported > needs_review > ok > none
+    - Tasks: concatenated with renumbered step_ids
+    - Constraints: union of all constraints
+    - Confidence: minimum confidence across sentences (capped at 1.0)
+    - Alternatives: generate full-plan alternatives by substituting one sentence's
+      alternative at a time; max 2 full-plan alternatives (rank 2/3).
+    """
+    if not sentence_results:
+        return _make_compact_result(
+            status="none",
+            confidence=0.0,
+            tasks=[],
+            constraints=[],
+            alternatives=[],
+            reason="no_action",
+        )
+
+    # Status propagation priority
+    statuses = [r.get("status", "none") for r in sentence_results]
+    if any(s == "unsupported" for s in statuses):
+        final_status = "unsupported"
+        final_reason = "vertical_motion_not_supported"
+    elif any(s == "needs_review" for s in statuses):
+        final_status = "needs_review"
+        # Collect reasons from failing chunks
+        reasons = []
+        for r in sentence_results:
+            if r.get("status") == "needs_review" and r.get("reason"):
+                reasons.append(r["reason"])
+        final_reason = reasons[0] if reasons else "sentence_chunk_requires_review"
+    elif any(s == "ok" for s in statuses):
+        final_status = "ok"
+        final_reason = None
+    else:
+        final_status = "none"
+        final_reason = "no_action"
+
+    # Concatenate tasks with renumbered step_ids
+    merged_tasks: List[Dict[str, Any]] = []
+    offset = 0
+    for r in sentence_results:
+        tasks = r.get("tasks", [])
+        for t in tasks:
+            new_task = dict(t)
+            new_task["step_id"] = t.get("step_id", 1) + offset
+            merged_tasks.append(new_task)
+        if tasks:
+            offset += len(tasks)
+
+    # Union constraints
+    seen_constraints: set = set()
+    merged_constraints: List[Dict[str, Any]] = []
+    import json
+    for r in sentence_results:
+        for c in r.get("constraints", []):
+            key = json.dumps(c, sort_keys=True)
+            if key not in seen_constraints:
+                seen_constraints.add(key)
+                merged_constraints.append(c)
+
+    # Confidence: minimum across sentences
+    confidences = [r.get("confidence", 0.0) for r in sentence_results if r.get("tasks")]
+    merged_confidence = min(confidences) if confidences else 0.0
+
+    # For unsupported/none, tasks must be empty per validator
+    if final_status in ("unsupported", "none"):
+        merged_tasks = []
+
+    # Build base merged result
+    merged: Dict[str, Any] = {
+        "status": final_status,
+        "confidence": round(merged_confidence, 2),
+        "tasks": merged_tasks,
+        "constraints": merged_constraints,
+        "alternatives": [],
+    }
+    if final_reason is not None:
+        merged["reason"] = final_reason
+
+    # Alternative generation: replace one sentence at a time
+    # Gather (sentence_idx, alt) pairs from sentence-level alternatives
+    alt_slots: List[tuple] = []
+    for sent_idx, r in enumerate(sentence_results):
+        for alt in r.get("alternatives", []):
+            rank = alt.get("rank")
+            if rank in (2, 3):
+                alt_slots.append((sent_idx, rank, alt))
+
+    # Sort by rank ascending (rank 2 before rank 3)
+    alt_slots.sort(key=lambda x: x[1])
+
+    # Build full-plan alternatives, replacing one sentence at a time
+    full_plan_alts: List[Dict[str, Any]] = []
+    used_ranks: set = set()
+    for sent_idx, rank, alt in alt_slots:
+        if rank in used_ranks:
+            continue
+        # Build full plan by substituting this sentence's alternative
+        alt_tasks: List[Dict[str, Any]] = []
+        alt_constraints: List[Dict[str, Any]] = []
+        alt_confs: List[float] = []
+        offset = 0
+        for i, r in enumerate(sentence_results):
+            if i == sent_idx:
+                tasks = alt.get("tasks", [])
+                conf = alt.get("confidence", 0.0)
+            else:
+                tasks = r.get("tasks", [])
+                conf = r.get("confidence", 0.0)
+            for t in tasks:
+                new_task = dict(t)
+                new_task["step_id"] = t.get("step_id", 1) + offset
+                alt_tasks.append(new_task)
+            if tasks:
+                offset += len(tasks)
+            if i == sent_idx:
+                alt_constraints.extend(alt.get("constraints", []))
+            else:
+                alt_constraints.extend(r.get("constraints", []))
+            alt_confs.append(conf)
+
+        # Deduplicate constraints
+        seen: set = set()
+        deduped_constraints: List[Dict[str, Any]] = []
+        for c in alt_constraints:
+            key = json.dumps(c, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                deduped_constraints.append(c)
+
+        full_plan_alts.append({
+            "rank": rank,
+            "confidence": min(alt_confs) if alt_confs else 0.0,
+            "tasks": alt_tasks,
+            "constraints": deduped_constraints,
+        })
+        used_ranks.add(rank)
+
+    merged["alternatives"] = full_plan_alts[:2]
+
+    # Validator bans alternatives on ok status; downgrade preemptively
+    if merged["alternatives"] and merged["status"] == "ok":
+        merged["status"] = "needs_review"
+
+    try:
+        validate_result(merged)
+    except ValueError:
+        # Degrade to needs_review if merged plan is invalid
+        merged["status"] = "needs_review"
+        merged["reason"] = "sentence_chunk_requires_review"
+        merged["alternatives"] = []
+
+    return merged
 
 
 def _make_compact_result(
