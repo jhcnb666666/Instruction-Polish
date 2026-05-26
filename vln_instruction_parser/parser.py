@@ -15,15 +15,12 @@ LOW_CONFIDENCE_MARGIN = 0.20
 
 def parse_instruction(
     text: str,
-    auto_accept_confidence: float = AUTO_ACCEPT_CONFIDENCE,
-    auto_accept_margin: float = AUTO_ACCEPT_MARGIN,
-    low_confidence_margin: float = LOW_CONFIDENCE_MARGIN,
 ) -> Dict[str, Any]:
     """
-    Parse an English 2D VLN instruction into an ordered list of compact tasks (rule-based).
+    Explicit rule-based parser. Returns compact tasks for simple instructions.
 
-    Simple instructions only. If the instruction contains complex temporal or
-    semantic structure, returns status="needs_review" with an empty task list.
+    This is a limited fallback interface. Results are NOT automatically accepted
+    as high-confidence execution plans.
     """
     cleaned_text = normalize_whitespace(text)
 
@@ -78,7 +75,7 @@ def parse_instruction(
             "step_id": step_id,
             "action": best["action"],
             "features": best.get("features", []),
-            "confidence": 1.0,
+            "confidence": 0.85,
         }
         if best.get("direction"):
             task["direction"] = best["direction"]
@@ -86,10 +83,10 @@ def parse_instruction(
         tasks.append(task)
         context = update_context(context, task)
 
-    # Simple rule path: always confidence 1.0, no alternatives
+    # Rule path: moderate confidence, no alternatives
     result = _make_compact_result(
         status="ok",
-        confidence=1.0,
+        confidence=0.85,
         tasks=tasks,
         constraints=[],
         alternatives=[],
@@ -107,22 +104,31 @@ def parse_instruction_auto(
     temperature: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Recommended entry point: automatically chooses rule or LLM parser.
+    Recommended entry point: LLM-first semantic pipeline for all valid English 2D instructions.
 
-    Simple instructions -> rule-based parser.
-    Complex instructions -> LLM parser with voting.
+    Simple and complex instructions both go through the LLM semantic pipeline
+    to receive uniform confidence/alternatives handling.
     """
-    from .complexity import requires_semantic_parser
-    if requires_semantic_parser(text):
-        return parse_instruction_llm(
-            text,
-            fallback_to_rules=False,
-            vote_count=vote_count,
-            base_url=base_url,
-            model=model,
-            temperature=temperature,
+    cleaned_text = normalize_whitespace(text)
+    if not cleaned_text or not any(c.isalpha() and ord(c) < 128 for c in cleaned_text):
+        result = _make_compact_result(
+            status="ok",
+            confidence=1.0,
+            tasks=[],
+            constraints=[],
+            alternatives=[],
         )
-    return parse_instruction(text)
+        validate_result(result)
+        return result
+
+    return parse_instruction_llm(
+        text,
+        fallback_to_rules=True,
+        vote_count=vote_count,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+    )
 
 
 def parse_instruction_llm(
@@ -136,7 +142,11 @@ def parse_instruction_llm(
     """
     Parse an English 2D VLN instruction using an LLM with semantic execution-order understanding.
 
-    Returns a compact parse result dict.
+    Flow:
+    1. Vote -> compile drafts -> group into top-3 candidates
+    2. Verifier ranks candidates with plan-level confidence
+    3. Apply confidence policy with 0.95/0.90 thresholds
+    4. Validate and return compact result
     """
     from . import llm, aggregator
     from .complexity import requires_semantic_parser
@@ -162,9 +172,8 @@ def parse_instruction_llm(
     )
 
     if not success:
-        if fallback_to_rules and not requires_semantic_parser(text):
-            result = parse_instruction(text)
-            return result
+        if fallback_to_rules:
+            return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
             confidence=0.0,
@@ -174,44 +183,12 @@ def parse_instruction_llm(
             reason="llm_unavailable_for_complex_instruction",
         )
 
-    agg_success, ranked_plans, needs_adjudication = aggregator.aggregate_votes(
-        raw_votes, text
-    )
+    # Step 1: aggregate votes into top-3 compact candidates
+    candidates = aggregator.aggregate_votes(raw_votes, text)
 
-    if needs_adjudication:
-        candidates = aggregator.get_conflict_candidates(raw_votes)
-        chosen_plan = llm.adjudicate_plan(
-            text, candidates,
-            base_url=base_url, model=model,
-        )
-
-        if chosen_plan is not None:
-            # Build a synthetic draft from adjudicated plan and compile it
-            draft = {
-                "actions": [
-                    {
-                        "id": f"a{i+1}",
-                        "action": step.get("action", "UNKNOWN"),
-                        "direction": step.get("direction"),
-                        "features": step.get("features", []),
-                        "confidence": 0.85,
-                    }
-                    for i, step in enumerate(chosen_plan)
-                ],
-                "order": [],
-                "constraints": [],
-                "excluded": [],
-            }
-            compiled = compile_draft(draft)
-            if compiled.get("status") != "unsupported":
-                compiled["status"] = "needs_review"
-                compiled["confidence"] = 0.89
-                return compiled
-
-    if not agg_success or not ranked_plans:
-        if fallback_to_rules and not requires_semantic_parser(text):
-            result = parse_instruction(text)
-            return result
+    if not candidates:
+        if fallback_to_rules:
+            return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
             confidence=0.0,
@@ -221,13 +198,82 @@ def parse_instruction_llm(
             reason="llm_aggregation_failed",
         )
 
-    # Apply plan-level confidence policy
+    # Step 2: verifier reranker
+    verifier_result = llm.verify_candidate_plans(
+        text, candidates,
+        base_url=base_url, model=model,
+    )
+
+    if verifier_result is not None:
+        # Map verifier confidence back to candidates
+        ranked_plans = []
+        for item in verifier_result:
+            cid = item["candidate_id"]
+            conf = item["confidence"]
+            cand = next((c for c in candidates if c.get("candidate_id") == cid), None)
+            if cand is not None:
+                plan = {
+                    "status": cand.get("status", "ok"),
+                    "confidence": conf,
+                    "tasks": cand.get("tasks", []),
+                    "constraints": cand.get("constraints", []),
+                }
+                if cand.get("reason") is not None:
+                    plan["reason"] = cand["reason"]
+                ranked_plans.append(plan)
+    else:
+        # Verifier failed: conservative degradation
+        main = candidates[0]
+        result = _make_compact_result(
+            status="needs_review",
+            confidence=0.0,
+            tasks=main.get("tasks", []),
+            constraints=main.get("constraints", []),
+            alternatives=[],
+            reason="confidence_verification_unavailable",
+        )
+        # Add up to two remaining candidates as alternatives with confidence 0.0
+        for idx, alt in enumerate(candidates[1:3], start=2):
+            result["alternatives"].append({
+                "rank": idx,
+                "confidence": 0.0,
+                "tasks": alt.get("tasks", []),
+                "constraints": alt.get("constraints", []),
+            })
+        try:
+            validate_result(result)
+        except ValueError:
+            if fallback_to_rules:
+                return parse_instruction(text)
+            return _make_compact_result(
+                status="needs_review",
+                confidence=0.0,
+                tasks=[],
+                constraints=[],
+                alternatives=[],
+                reason="llm_validation_failed",
+            )
+        return result
+
+    if not ranked_plans:
+        if fallback_to_rules:
+            return parse_instruction(text)
+        return _make_compact_result(
+            status="needs_review",
+            confidence=0.0,
+            tasks=[],
+            constraints=[],
+            alternatives=[],
+            reason="llm_aggregation_failed",
+        )
+
+    # Step 3: apply confidence policy
     final = apply_plan_confidence_policy(ranked_plans)
 
     try:
         validate_result(final)
     except ValueError:
-        if fallback_to_rules and not requires_semantic_parser(text):
+        if fallback_to_rules:
             return parse_instruction(text)
         return _make_compact_result(
             status="needs_review",
@@ -289,11 +335,14 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
 
     alternatives: List[Dict[str, Any]] = []
 
+    def _diff(a, b):
+        return round(a - b, 4)
+
     if c1 > 0.90:
         # Tier 2
         if len(ranked_plans) >= 2:
             c2 = ranked_plans[1].get("confidence", 0.0)
-            if c1 - c2 < 0.15:
+            if _diff(c1, c2) < 0.15:
                 alternatives.append({
                     "rank": 2,
                     "confidence": c2,
@@ -302,7 +351,7 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
                 })
         if len(ranked_plans) >= 3:
             c3 = ranked_plans[2].get("confidence", 0.0)
-            if c1 - c3 < 0.15:
+            if _diff(c1, c3) < 0.15:
                 alternatives.append({
                     "rank": 3,
                     "confidence": c3,
@@ -314,7 +363,7 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
         # Tier 3
         if len(ranked_plans) >= 2:
             c2 = ranked_plans[1].get("confidence", 0.0)
-            if c1 - c2 < 0.20:
+            if _diff(c1, c2) < 0.20:
                 alternatives.append({
                     "rank": 2,
                     "confidence": c2,
@@ -323,7 +372,7 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
                 })
         if len(ranked_plans) >= 3:
             c3 = ranked_plans[2].get("confidence", 0.0)
-            if c1 - c3 < 0.20:
+            if _diff(c1, c3) < 0.20:
                 alternatives.append({
                     "rank": 3,
                     "confidence": c3,
