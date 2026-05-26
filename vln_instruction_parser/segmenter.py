@@ -1,7 +1,7 @@
 """English instruction segmentation."""
 
 import re
-from typing import List
+from typing import List, Tuple
 
 
 # Split markers ordered by priority (more specific first)
@@ -20,10 +20,119 @@ TRANSITION_WORDS = {
     "subsequently", "thereafter", "meanwhile", "finally",
 }
 
+# Abbreviations that end with a period but should NOT be sentence boundaries
+ABBREVIATIONS = {
+    "e.g", "i.e", "mr", "mrs", "dr", "st", "ave", "blvd",
+    "etc", "vol", "vols", "inc", "ltd", "jr", "sr", "prof",
+    "fig", "figs", "et al", "vs", "viz",
+}
+
+# Cross-sentence anaphora / back-reference markers that make safe per-sentence parsing impossible
+CROSS_SENTENCE_BACKREFS = {
+    "it", "there", "this", "that", "those", "same",
+    "previous", "former", "latter", "do so", "doing so",
+}
+
+# Sentence-initial cross-sentence rewrite / reordering markers
+CROSS_SENTENCE_REWRITE_STARTERS = {
+    "instead", "rather than", "before that",
+}
+
+# Safe sequential continuers that allow per-sentence processing
+SAFE_SENTENCE_CONTINUERS = {
+    "then", "next", "finally", "after that",
+}
+
 
 def normalize_whitespace(text: str) -> str:
     """Collapse multiple whitespace characters into single spaces."""
     return " ".join(text.split())
+
+
+def split_sentences_for_llm(text: str) -> List[str]:
+    """
+    Split text into sentences for per-sentence LLM parsing.
+
+    Rules:
+    - Split only on ., ?, ! followed by space or end-of-string.
+    - Do NOT split on commas, 'then', 'before', 'instead'.
+    - Protect common abbreviations (e.g., i.e., Mr., Dr., St.) from being cut.
+    - Preserve all punctuation and intra-sentence structure.
+    """
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return []
+
+    # Protect abbreviations by temporarily replacing their trailing period
+    protected = cleaned
+    placeholders: List[Tuple[str, str]] = []
+    placeholder_idx = 0
+
+    # Match abbreviations as whole words (case-insensitive)
+    for abbrev in ABBREVIATIONS:
+        pattern = rf"\b{re.escape(abbrev)}\."
+        for match in re.finditer(pattern, protected, flags=re.IGNORECASE):
+            ph = f"\x00ABBREV{placeholder_idx}\x00"
+            placeholders.append((ph, match.group(0)))
+            protected = protected[:match.start()] + ph + protected[match.end():]
+            placeholder_idx += 1
+
+    # Also protect decimal numbers like "3.14"
+    for match in re.finditer(r"\d+\.\d+", protected):
+        ph = f"\x00DECIMAL{placeholder_idx}\x00"
+        placeholders.append((ph, match.group(0)))
+        protected = protected[:match.start()] + ph + protected[match.end():]
+        placeholder_idx += 1
+
+    # Split on sentence-ending punctuation followed by space or end
+    raw_parts = re.split(r'(?<=[.!?])(?:\s+|$)', protected)
+
+    sentences = []
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Restore placeholders
+        for ph, original in placeholders:
+            part = part.replace(ph, original)
+        sentences.append(part)
+
+    return sentences
+
+
+def has_cross_sentence_dependency(sentences: List[str]) -> Tuple[bool, str]:
+    """
+    Detect whether a multi-sentence instruction contains anaphora or
+    cross-sentence reordering that makes safe per-sentence parsing impossible.
+
+    Returns:
+        (True, reason) if a dependency is found.
+        (False, "") if safe to process sentence-by-sentence.
+    """
+    if len(sentences) < 2:
+        return False, ""
+
+    for i, sent in enumerate(sentences[1:], start=1):
+        lower = sent.lower().strip()
+        # Remove leading safe continuers for checking
+        stripped = lower
+        for continuer in SAFE_SENTENCE_CONTINUERS:
+            if stripped.startswith(continuer + " "):
+                stripped = stripped[len(continuer):].strip()
+                break
+
+        # Check back-references
+        for ref in CROSS_SENTENCE_BACKREFS:
+            # Match as whole word or phrase
+            if re.search(rf"\b{re.escape(ref)}\b", stripped):
+                return True, f"cross_sentence_dependency_requires_review: backref '{ref}' in sentence {i+1}"
+
+        # Check sentence-initial rewrite/reordering markers
+        for starter in CROSS_SENTENCE_REWRITE_STARTERS:
+            if lower.startswith(starter):
+                return True, f"cross_sentence_dependency_requires_review: rewrite starter '{starter}' in sentence {i+1}"
+
+    return False, ""
 
 
 def segment_instruction(text: str) -> List[str]:
