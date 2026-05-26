@@ -145,7 +145,7 @@ def result_from_dict(d: dict) -> ParseResult:
         status=d["status"],
         confidence=d["confidence"],
         tasks=[task_from_dict(t) for t in d.get("tasks", [])],
-        constraints=[constraint_to_dict(c) for c in d.get("constraints", [])],
-        alternatives=[alternative_plan_to_dict(a) for a in d.get("alternatives", [])],
+        constraints=[constraint_from_dict(c) for c in d.get("constraints", [])],
+        alternatives=[alternative_plan_from_dict(a) for a in d.get("alternatives", [])],
         reason=d.get("reason"),
     )

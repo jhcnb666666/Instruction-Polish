@@ -80,8 +80,17 @@ def validate_result(result: Dict[str, Any]) -> None:
     alternatives = result.get("alternatives", [])
     if not isinstance(alternatives, list):
         raise ValueError("alternatives must be a list")
+    seen_ranks: set = set()
+    prev_rank = 0
     for alt in alternatives:
         _validate_alternative_plan(alt)
+        rank = alt.get("rank")
+        if rank in seen_ranks:
+            raise ValueError(f"Duplicate alternative rank: {rank}")
+        seen_ranks.add(rank)
+        if rank <= prev_rank:
+            raise ValueError(f"Alternative ranks must be ascending; got {rank} after {prev_rank}")
+        prev_rank = rank
 
     # Gate rules for status
     if status == "unsupported":
@@ -93,6 +102,9 @@ def validate_result(result: Dict[str, Any]) -> None:
             raise ValueError("status=ok must not have alternatives")
         if result.get("reason") is not None:
             raise ValueError("status=ok must not have a reason")
+        for task in tasks:
+            if task.get("action") == "UNKNOWN":
+                raise ValueError("status=ok must not have UNKNOWN action")
 
     if status == "none":
         if tasks:
