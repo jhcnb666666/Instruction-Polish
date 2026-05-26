@@ -89,18 +89,7 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             valid_features.append(f)
         a["features"] = valid_features
 
-    # 8. Detect vertical motion in remaining actions
-    for a in actions:
-        if _is_active_vertical_action(a):
-            return {
-                "status": "unsupported",
-                "confidence": 1.0,
-                "tasks": [],
-                "constraints": [],
-                "reason": "vertical_motion_not_supported",
-            }
-
-    # 3. Prune excluded actions
+    # 3. Prune excluded actions BEFORE vertical detection
     excluded_ids = set()
     for ex in excluded:
         if isinstance(ex, dict):
@@ -109,6 +98,17 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             excluded_ids.add(ex)
 
     remaining_actions = [a for a in actions if a.get("id") not in excluded_ids]
+
+    # 8. Detect vertical motion in remaining actions only
+    for a in remaining_actions:
+        if _is_active_vertical_action(a):
+            return {
+                "status": "unsupported",
+                "confidence": 1.0,
+                "tasks": [],
+                "constraints": [],
+                "reason": "vertical_motion_not_supported",
+            }
 
     # 4. Convert safety constraints
     constraints: List[Dict[str, Any]] = []
@@ -124,7 +124,11 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             constraints.append(constraint)
 
     # 5. Topological sort
-    sorted_actions = _topological_sort(remaining_actions, order)
+    topo_result = _topological_sort(remaining_actions, order)
+    if isinstance(topo_result, dict):
+        # Cycle detected
+        return topo_result
+    sorted_actions = topo_result
 
     # 6. Assign step_id and build compact tasks
     tasks: List[Dict[str, Any]] = []
@@ -139,6 +143,11 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         if direction and direction in VALID_DIRECTIONS:
             task["direction"] = direction
         tasks.append(task)
+
+    # Check for UNKNOWN actions in the final plan
+    for t in tasks:
+        if t.get("action") == "UNKNOWN":
+            return _unsupported("unknown_action_in_plan")
 
     # Build result
     result: Dict[str, Any] = {
@@ -210,8 +219,8 @@ def _topological_sort(actions: List[Dict[str, Any]], order: List[Dict[str, Any]]
                 queue.append(neighbor)
 
     if len(result) != len(actions):
-        # Cycle detected; fall back to original order
-        return actions[:]
+        # Cycle detected; return needs_review with empty tasks
+        return _unsupported("cyclic_execution_order")
 
     return result
 
