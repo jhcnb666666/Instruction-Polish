@@ -1,6 +1,5 @@
-"""Top-3 candidate extraction for each instruction segment — compact feature output."""
+"""Top candidate extraction for each instruction segment — compact feature output."""
 
-import copy
 from typing import List, Dict, Any
 
 from .normalizer import (
@@ -15,13 +14,11 @@ from .normalizer import (
 
 def extract_candidates(segment: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Extract top-3 candidate parses for a single segment.
+    Extract the best candidate parse for a single segment.
 
-    Each candidate is a compact dict with:
-    - action
-    - direction (optional)
-    - features: list of compact feature dicts
-    - confidence
+    Returns a single-candidate list to maintain interface compatibility.
+    Alternative candidates must come from actual LLM semantic interpretation,
+    not from synthetic perturbation.
     """
     base = _extract_base_candidate(segment)
 
@@ -30,38 +27,9 @@ def extract_candidates(segment: str, context: Dict[str, Any]) -> List[Dict[str, 
         base["action"] = "UNKNOWN"
         base["direction"] = None
         base["confidence"] = max(0.0, base["confidence"] - 0.30)
-        cands = [copy.deepcopy(base) for _ in range(3)]
-        cands[0]["confidence"] = max(0.0, cands[0]["confidence"])
-        cands[1]["confidence"] = max(0.0, cands[1]["confidence"] - 0.05)
-        cands[2]["confidence"] = max(0.0, cands[2]["confidence"] - 0.10)
-        return sort_candidates(cands)
+        return sort_candidates([base])
 
-    candidates = [base]
-
-    # Candidate 2: alternate direction if direction was found
-    alt2 = copy.deepcopy(base)
-    if base.get("direction") is not None:
-        alt2["direction"] = _alternate_direction(base["direction"])
-        alt2["confidence"] = max(0.0, alt2["confidence"] - 0.08)
-    else:
-        # perturb relation in features instead
-        alt2["features"] = _perturb_relation_in_features(alt2["features"])
-        alt2["confidence"] = max(0.0, alt2["confidence"] - 0.05)
-    candidates.append(alt2)
-
-    # Candidate 3: alternate action or perturb
-    alt3 = copy.deepcopy(base)
-    if base["action"] in ("GO_TO", "MOVE_FORWARD"):
-        alt3["action"] = "GO_TO" if base["action"] == "MOVE_FORWARD" else "MOVE_FORWARD"
-        alt3["confidence"] = max(0.0, alt3["confidence"] - 0.10)
-    elif base["action"] == "UNKNOWN":
-        alt3["confidence"] = max(0.0, alt3["confidence"] - 0.03)
-    else:
-        alt3["features"] = _perturb_relation_in_features(alt3["features"])
-        alt3["confidence"] = max(0.0, alt3["confidence"] - 0.06)
-    candidates.append(alt3)
-
-    return sort_candidates(candidates)
+    return sort_candidates([base])
 
 
 def _extract_base_candidate(segment: str) -> Dict[str, Any]:
@@ -103,32 +71,6 @@ def _extract_base_candidate(segment: str) -> Dict[str, Any]:
         })
 
     return candidate
-
-
-def _alternate_direction(direction: str) -> str:
-    """Return a plausible alternative direction."""
-    opposites = {
-        "left": "right",
-        "right": "left",
-        "forward": "backward",
-        "backward": "forward",
-        "straight": "forward",
-        "around": "left",
-    }
-    return opposites.get(direction, "left")
-
-
-def _perturb_relation_in_features(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Toggle relation between 'at' and 'near' in features."""
-    out = []
-    for f in features:
-        nf = dict(f)
-        if nf.get("relation") == "at":
-            nf["relation"] = "near"
-        elif nf.get("relation") == "near":
-            nf["relation"] = "at"
-        out.append(nf)
-    return out
 
 
 def sort_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
