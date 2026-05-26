@@ -200,6 +200,33 @@ Output format:
 Output ONLY the JSON object.
 """
 
+STEP_VERIFIER_SYSTEM_PROMPT = """You are a step-level confidence verifier for 2D VLN navigation instructions.
+
+Given the original instruction, the primary execution plan, and optional alternative step candidates,
+rate the semantic confidence of each primary step and each candidate step.
+
+Rules:
+- Confidence must be between 0.0 and 1.0.
+- Higher confidence means the step more accurately reflects the instruction semantics.
+- Review the original instruction carefully before rating.
+- Rate primary steps independently based on how well they match the instruction.
+- Rate candidate steps relative to their primary counterpart; if a candidate changes the meaning significantly, assign low confidence.
+- Return ONLY a JSON object with "step_confidences" and "candidate_confidences".
+
+Output format:
+{
+  "step_confidences": [
+    {"step_id": 1, "confidence": 0.97},
+    {"step_id": 2, "confidence": 0.93}
+  ],
+  "candidate_confidences": [
+    {"step_id": 2, "rank": 2, "confidence": 0.84}
+  ]
+}
+
+Output ONLY the JSON object.
+"""
+
 
 def _get_config() -> Dict[str, Any]:
     backend = os.getenv("VLN_LLM_BACKEND", DEFAULT_BACKEND).lower()
@@ -259,6 +286,33 @@ def _build_verifier_prompt(instruction: str, candidates: List[Dict[str, Any]]) -
         '',
         'Rank these candidates by how well they match the instruction.',
         'Return ONLY a JSON object: {"ranked_candidates": [{"candidate_id":"p1","confidence":0.94}, ...]}',
+    ])
+    return '\n'.join(lines)
+
+
+def _build_step_verifier_prompt(
+    instruction: str,
+    primary_tasks: List[Dict[str, Any]],
+    step_candidate_pools: Dict[int, List[Dict[str, Any]]],
+) -> str:
+    lines = [
+        f'Instruction: "{instruction}"',
+        '',
+        'Primary execution plan:',
+    ]
+    for t in primary_tasks:
+        lines.append(f'  step {t["step_id"]}: {json.dumps(t, default=str)}')
+
+    if step_candidate_pools:
+        lines.extend(['', 'Alternative step candidates:'])
+        for step_id, cands in sorted(step_candidate_pools.items()):
+            for i, cand in enumerate(cands, start=2):
+                lines.append(f'  step {step_id} (alternative {i}): {json.dumps(cand, default=str)}')
+
+    lines.extend([
+        '',
+        'Rate the confidence of each primary step and each alternative step.',
+        'Return ONLY a JSON object: {"step_confidences": [{"step_id":1,"confidence":0.97},...], "candidate_confidences": [{"step_id":2,"rank":2,"confidence":0.84},...]}',
     ])
     return '\n'.join(lines)
 
@@ -365,6 +419,122 @@ def verify_candidate_plans(
     # Sort by confidence descending (stable)
     out.sort(key=lambda x: x["confidence"], reverse=True)
     return out
+
+
+def verify_step_candidates(
+    instruction: str,
+    primary_tasks: List[Dict[str, Any]],
+    step_candidate_pools: Dict[int, List[Dict[str, Any]]],
+    **overrides: Any,
+) -> Optional[Dict[str, Any]]:
+    """
+    Ask the LLM to rate confidence of each primary step and each step candidate.
+
+    Args:
+        instruction: Original instruction.
+        primary_tasks: List of primary task dicts (the chosen main plan).
+        step_candidate_pools: Dict mapping step_id -> list of candidate task dicts.
+        **overrides: Backend overrides.
+
+    Returns:
+        Dict with "step_confidences" and "candidate_confidences", or None if verifier fails.
+    """
+    if not primary_tasks:
+        return None
+
+    cfg = _get_config()
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+
+    prompt = _build_step_verifier_prompt(instruction, primary_tasks, step_candidate_pools)
+    system_prompt = STEP_VERIFIER_SYSTEM_PROMPT
+
+    if cfg["backend"] == "local":
+        result = _call_local(
+            instruction,
+            cfg["model_path"],
+            temperature=0.0,
+            max_tokens=cfg["max_tokens"],
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+        )
+    else:
+        url = f"{cfg['base_url']}/chat/completions"
+        payload = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {cfg['api_key']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                body = resp.read().decode("utf-8")
+                response_json = json.loads(body)
+            content = response_json["choices"][0]["message"]["content"]
+            result = json.loads(content)
+        except Exception:
+            return None
+
+    if result is None:
+        return None
+
+    step_confidences = result.get("step_confidences")
+    candidate_confidences = result.get("candidate_confidences")
+    if not isinstance(step_confidences, list) or not isinstance(candidate_confidences, list):
+        return None
+
+    # Validate step_confidences
+    primary_step_ids = {t.get("step_id") for t in primary_tasks}
+    seen_step_ids: set = set()
+    out_steps: List[Dict[str, Any]] = []
+    for item in step_confidences:
+        if not isinstance(item, dict):
+            continue
+        sid = item.get("step_id")
+        conf = item.get("confidence")
+        if sid not in primary_step_ids:
+            return None
+        if sid in seen_step_ids:
+            return None
+        if not isinstance(conf, (int, float)) or not (0.0 <= conf <= 1.0):
+            return None
+        seen_step_ids.add(sid)
+        out_steps.append({"step_id": sid, "confidence": float(conf)})
+
+    # Validate candidate_confidences
+    out_cands: List[Dict[str, Any]] = []
+    for item in candidate_confidences:
+        if not isinstance(item, dict):
+            continue
+        sid = item.get("step_id")
+        rank = item.get("rank")
+        conf = item.get("confidence")
+        if sid not in primary_step_ids:
+            return None
+        if not isinstance(rank, int) or rank not in (2, 3):
+            return None
+        if not isinstance(conf, (int, float)) or not (0.0 <= conf <= 1.0):
+            return None
+        out_cands.append({"step_id": sid, "rank": rank, "confidence": float(conf)})
+
+    return {
+        "step_confidences": out_steps,
+        "candidate_confidences": out_cands,
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════

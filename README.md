@@ -195,7 +195,24 @@ Three parsers are available:
     }
   ],
   "constraints": [],
-  "alternatives": []
+  "alternatives": [],
+  "backtracking": {
+    "step_candidates": [
+      {
+        "step_id": 2,
+        "candidates": [
+          {
+            "rank": 2,
+            "step_id": 2,
+            "action": "TURN",
+            "direction": "right",
+            "features": [],
+            "confidence": 0.82
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
 
@@ -214,9 +231,19 @@ Three parsers are available:
 
 | Input type | `parse_instruction_auto` | `parse_instruction` | `parse_instruction_llm` |
 |---|---|---|---|
-| Simple (1-2 actions, no temporal words) | Rule engine | Rule engine | Rule fallback if LLM fails |
-| Complex (before/after/until/instead of/do not, 3+ actions, stairs/elevator) | LLM with voting | `status=needs_review`, empty tasks | LLM; fail-closed if LLM unavailable |
+| Simple (1-2 actions, no temporal words) | Rule engine | Rule engine | Rule fallback only on LLM failure |
+| Complex (before/after/until/instead of/do not, 3+ actions, stairs/elevator) | LLM with voting + step-level backtracking | `status=needs_review`, empty tasks | LLM with step-level backtracking; rule fallback only on backend failure |
 | Active vertical (upstairs, downstairs, take elevator) | `status=unsupported` | `status=unsupported` | `status=unsupported` |
+
+### Step-Level Backtracking
+
+When the LLM parser produces multiple competing interpretations, it now emits **step-level backtracking candidates** instead of full-plan alternatives:
+
+- **`backtracking.step_candidates`** — a list of groups, one per ambiguous step.
+- Each group contains `rank: 2|3` candidates that differ from the primary task at that `step_id`.
+- The `alternatives` field is deprecated for new output and will be empty when `status="ok"`.
+
+This design lets downstream planners explore local revisions (e.g., "turn left" vs "turn right" at step 2) without re-parsing the entire instruction.
 
 ### Running VLN Parser Tests
 

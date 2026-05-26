@@ -203,3 +203,131 @@ class TestValidateResult:
             "reason": "vertical_motion_not_supported",
         }
         validate_result(result)
+
+    def test_ok_with_backtracking(self):
+        result = {
+            "status": "ok",
+            "confidence": 0.92,
+            "tasks": [make_valid_task(step_id=1), make_valid_task(step_id=2)],
+            "constraints": [],
+            "alternatives": [],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 2,
+                        "candidates": [
+                            {"rank": 2, "step_id": 2, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85},
+                            {"rank": 3, "step_id": 2, "action": "TURN", "direction": "right", "features": [], "confidence": 0.80},
+                        ],
+                    }
+                ]
+            },
+        }
+        validate_result(result)
+
+    def test_backtracking_group_step_id_not_found(self):
+        result = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [make_valid_task(step_id=1)],
+            "constraints": [],
+            "alternatives": [],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 99,
+                        "candidates": [
+                            {"rank": 2, "step_id": 99, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85},
+                        ],
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError, match="not found in primary tasks"):
+            validate_result(result)
+
+    def test_backtracking_candidate_wrong_step_id(self):
+        result = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [make_valid_task(step_id=1), make_valid_task(step_id=2)],
+            "constraints": [],
+            "alternatives": [],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 1,
+                        "candidates": [
+                            {"rank": 2, "step_id": 2, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85},
+                        ],
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError, match="does not match group step_id"):
+            validate_result(result)
+
+    def test_backtracking_duplicate_rank(self):
+        result = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [make_valid_task(step_id=1)],
+            "constraints": [],
+            "alternatives": [],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 1,
+                        "candidates": [
+                            {"rank": 2, "step_id": 1, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85},
+                            {"rank": 2, "step_id": 1, "action": "TURN", "direction": "right", "features": [], "confidence": 0.80},
+                        ],
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError, match="Duplicate backtracking candidate rank"):
+            validate_result(result)
+
+    def test_backtracking_rank_not_2_or_3(self):
+        result = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [make_valid_task(step_id=1)],
+            "constraints": [],
+            "alternatives": [],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 1,
+                        "candidates": [
+                            {"rank": 1, "step_id": 1, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85},
+                        ],
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError, match="rank must be 2 or 3"):
+            validate_result(result)
+
+    def test_backtracking_descending_rank(self):
+        result = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [make_valid_task(step_id=1)],
+            "constraints": [],
+            "alternatives": [],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 1,
+                        "candidates": [
+                            {"rank": 3, "step_id": 1, "action": "TURN", "direction": "left", "features": [], "confidence": 0.85},
+                            {"rank": 2, "step_id": 1, "action": "TURN", "direction": "right", "features": [], "confidence": 0.80},
+                        ],
+                    }
+                ]
+            },
+        }
+        with pytest.raises(ValueError, match="must be ascending within step"):
+            validate_result(result)

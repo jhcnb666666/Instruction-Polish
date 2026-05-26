@@ -135,6 +135,108 @@ def _union_dicts(dict_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]
     return result
 
 
+def extract_valid_plan_pool(
+    raw_votes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Compile all raw votes and return every distinct valid executable plan.
+
+    Unlike aggregate_votes which only returns top-3 signatures,
+    this preserves all valid plans for downstream local step-candidate extraction.
+
+    Returns:
+        List of valid compact plan dicts (each with status="ok" and non-empty tasks).
+    """
+    if not raw_votes:
+        return []
+
+    seen: set = set()
+    pool: List[Dict[str, Any]] = []
+    for vote in raw_votes:
+        plan = compile_draft(vote)
+        if not _is_valid_executable_plan(plan):
+            continue
+        sig = _plan_signature(plan)
+        if sig not in seen:
+            seen.add(sig)
+            pool.append(plan)
+    return pool
+
+
+def extract_step_candidates(
+    primary_plan: Dict[str, Any],
+    all_valid_plans: List[Dict[str, Any]],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Compare all valid plans against the selected primary plan and extract
+    local step-level candidates that differ in exactly one task.
+
+    Rules:
+    - Candidate must have same number of tasks as primary, in same order.
+    - Constraints must be identical.
+    - Exactly one task may differ.
+    - The differing task maps to the corresponding primary step_id.
+
+    Returns:
+        Dict mapping step_id -> list of differing task dicts (candidate tasks).
+    """
+    primary_tasks = primary_plan.get("tasks", [])
+    primary_constraints = primary_plan.get("constraints", [])
+    primary_constraint_sig = tuple(sorted(json.dumps(c, sort_keys=True) for c in primary_constraints))
+
+    if not primary_tasks:
+        return {}
+
+    candidates_by_step: Dict[int, List[Dict[str, Any]]] = {}
+
+    for plan in all_valid_plans:
+        # Skip the primary plan itself
+        if _plan_signature(plan) == _plan_signature(primary_plan):
+            continue
+
+        tasks = plan.get("tasks", [])
+        constraints = plan.get("constraints", [])
+
+        # Same task count
+        if len(tasks) != len(primary_tasks):
+            continue
+
+        # Same constraints
+        constraint_sig = tuple(sorted(json.dumps(c, sort_keys=True) for c in constraints))
+        if constraint_sig != primary_constraint_sig:
+            continue
+
+        # Find differing tasks
+        diffs = []
+        for i, (pt, ct) in enumerate(zip(primary_tasks, tasks)):
+            if not _task_eq(pt, ct):
+                diffs.append((i, ct))
+
+        # Exactly one task differs
+        if len(diffs) != 1:
+            continue
+
+        step_idx, candidate_task = diffs[0]
+        step_id = primary_tasks[step_idx].get("step_id", step_idx + 1)
+        candidates_by_step.setdefault(step_id, []).append(candidate_task)
+
+    return candidates_by_step
+
+
+def _task_eq(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Check whether two task dicts are identical for diff comparison."""
+    if a.get("action") != b.get("action"):
+        return False
+    if a.get("direction") != b.get("direction"):
+        return False
+    # Compare features as sorted tuples for order-independent comparison
+    a_features = a.get("features", [])
+    b_features = b.get("features", [])
+    a_sig = tuple(sorted(json.dumps(f, sort_keys=True) for f in a_features))
+    b_sig = tuple(sorted(json.dumps(f, sort_keys=True) for f in b_features))
+    return a_sig == b_sig
+
+
 def get_conflict_candidates(
     raw_votes: List[Dict[str, Any]]
 ) -> List[List[Dict[str, Any]]]:

@@ -36,7 +36,7 @@ def parse_instruction(
             confidence=1.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
         )
         validate_result(result)
         return result
@@ -49,7 +49,7 @@ def parse_instruction(
             confidence=1.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="vertical_motion_not_supported",
         )
 
@@ -60,7 +60,7 @@ def parse_instruction(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="semantic_parser_required",
         )
 
@@ -88,13 +88,16 @@ def parse_instruction(
         tasks.append(task)
         context = update_context(context, task)
 
-    # Rule path: moderate confidence, no alternatives
+    # Rule path: moderate confidence, no backtracking
+    # If any task has UNKNOWN action, degrade to needs_review
+    has_unknown = any(t.get("action") == "UNKNOWN" for t in tasks)
     result = _make_compact_result(
-        status="ok",
+        status="needs_review" if has_unknown else "ok",
         confidence=0.85,
         tasks=tasks,
         constraints=[],
-        alternatives=[],
+        backtracking={},
+        reason="rule_fallback_due_to_llm_unavailable" if has_unknown else None,
     )
 
     validate_result(result)
@@ -112,7 +115,7 @@ def parse_instruction_auto(
     Recommended entry point: LLM-first semantic pipeline for all valid English 2D instructions.
 
     Simple and complex instructions both go through the LLM semantic pipeline
-    to receive uniform confidence/alternatives handling.
+    to receive uniform confidence/backtracking handling.
 
     Multi-sentence instructions are split sentence-by-sentence when no
     cross-sentence dependencies are detected; otherwise parsed as a whole
@@ -127,21 +130,10 @@ def parse_instruction_auto(
             confidence=1.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
         )
         validate_result(result)
         return result
-
-    from .complexity import has_active_vertical_motion
-    if has_active_vertical_motion(cleaned_text):
-        return _make_compact_result(
-            status="unsupported",
-            confidence=1.0,
-            tasks=[],
-            constraints=[],
-            alternatives=[],
-            reason="vertical_motion_not_supported",
-        )
 
     sentences = split_sentences_for_llm(cleaned_text)
 
@@ -183,7 +175,7 @@ def parse_instruction_auto(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="sentence_chunk_limit_exceeded",
         )
 
@@ -221,7 +213,7 @@ def _parse_single_sentence_llm(
     temperature: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Parse a single sentence via LLM vote → aggregate → verify → policy.
+    Parse a single sentence via LLM vote → aggregate → verify → policy → backtracking.
 
     No pre-flight checks (caller already gated). No rule fallback.
     """
@@ -241,10 +233,11 @@ def _parse_single_sentence_llm(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="sentence_chunk_unparsed",
         )
 
+    # 1. Aggregate top-3 candidates for verifier
     candidates = aggregator.aggregate_votes(raw_votes, text)
     if not candidates:
         return _make_compact_result(
@@ -252,10 +245,14 @@ def _parse_single_sentence_llm(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="sentence_chunk_unparsed",
         )
 
+    # 2. Collect ALL valid distinct plans for local step-candidate extraction
+    all_valid_plans = aggregator.extract_valid_plan_pool(raw_votes)
+
+    # 3. Verifier ranks top-3 candidates
     verifier_result = llm.verify_candidate_plans(
         text, candidates,
         base_url=base_url, model=model,
@@ -285,16 +282,9 @@ def _parse_single_sentence_llm(
             confidence=0.0,
             tasks=main.get("tasks", []),
             constraints=main.get("constraints", []),
-            alternatives=[],
+            backtracking={},
             reason="confidence_verification_unavailable",
         )
-        for idx, alt in enumerate(candidates[1:3], start=2):
-            result["alternatives"].append({
-                "rank": idx,
-                "confidence": 0.0,
-                "tasks": alt.get("tasks", []),
-                "constraints": alt.get("constraints", []),
-            })
         try:
             validate_result(result)
         except ValueError:
@@ -303,7 +293,7 @@ def _parse_single_sentence_llm(
                 confidence=0.0,
                 tasks=[],
                 constraints=[],
-                alternatives=[],
+                backtracking={},
                 reason="sentence_chunk_requires_review",
             )
         return result
@@ -314,11 +304,40 @@ def _parse_single_sentence_llm(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="sentence_chunk_unparsed",
         )
 
+    # 4. Apply overall confidence policy (no alternatives)
     final = apply_plan_confidence_policy(ranked_plans)
+
+    # 5. Extract local step candidates from all valid plans vs primary plan
+    primary_plan = ranked_plans[0]
+    step_pools = aggregator.extract_step_candidates(primary_plan, all_valid_plans)
+
+    # 6. Step verifier: rate primary steps and candidates
+    backtracking = {"step_candidates": []}
+    if step_pools:
+        step_verifier_result = llm.verify_step_candidates(
+            text,
+            primary_plan.get("tasks", []),
+            step_pools,
+            base_url=base_url, model=model,
+        )
+        if step_verifier_result is not None:
+            backtracking = apply_step_candidate_policy(
+                step_verifier_result.get("step_confidences", []),
+                step_verifier_result.get("candidate_confidences", []),
+                step_pools,
+            )
+        else:
+            # Step verifier failed: keep empty backtracking, but if we had
+            # candidates that looked close, degrade to needs_review
+            if final.get("status") == "ok":
+                final["status"] = "needs_review"
+                final["reason"] = "step_confidence_verification_unavailable"
+
+    final["backtracking"] = backtracking
 
     try:
         validate_result(final)
@@ -328,7 +347,7 @@ def _parse_single_sentence_llm(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="sentence_chunk_requires_review",
         )
 
@@ -350,7 +369,8 @@ def parse_instruction_llm(
     1. Vote -> compile drafts -> group into top-3 candidates
     2. Verifier ranks candidates with plan-level confidence
     3. Apply confidence policy with 0.95/0.90 thresholds
-    4. Validate and return compact result
+    4. Build step-level backtracking candidates
+    5. Validate and return compact result
     """
     cleaned_text = normalize_whitespace(text)
     if not cleaned_text or not any(c.isalpha() and ord(c) < 128 for c in cleaned_text):
@@ -359,7 +379,7 @@ def parse_instruction_llm(
             confidence=1.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
         )
         validate_result(result)
         return result
@@ -372,7 +392,10 @@ def parse_instruction_llm(
         temperature=temperature,
     )
 
-    if result["status"] in ("needs_review", "unsupported", "none") and fallback_to_rules:
+    # Only fallback to rules when LLM produced no usable tasks.
+    # A legitimate needs_review result with parsed tasks should NOT
+    # be silently replaced by rule output, because that would lose candidates.
+    if not result.get("tasks") and fallback_to_rules:
         return parse_instruction(text)
 
     return result
@@ -380,15 +403,21 @@ def parse_instruction_llm(
 
 def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Apply the three-tier confidence policy to a list of ranked compact plans.
+    Apply the three-tier confidence policy to choose the primary complete plan.
+
+    This function NO LONGER generates full-plan alternatives.
+    It only determines:
+    - overall status (ok / needs_review / unsupported / none)
+    - overall confidence
+    - primary tasks and constraints
 
     C1 = first plan confidence
     C2 = second plan confidence
     C3 = third plan confidence
 
-    Tier 1: C1 > 0.95 -> confidence=1.0, ok, no alternatives.
-    Tier 2: 0.90 < C1 <= 0.95 -> compare C1-C2 < 0.15, C1-C3 < 0.15.
-    Tier 3: C1 <= 0.90 -> compare C1-C2 < 0.20, C1-C3 < 0.20.
+    Tier 1: C1 > 0.95 -> confidence=1.0, ok.
+    Tier 2: 0.90 < C1 <= 0.95 -> ok if no non-localizable competition.
+    Tier 3: C1 <= 0.90 -> needs_review.
     """
     if not ranked_plans:
         return _make_compact_result(
@@ -396,7 +425,7 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="no_action",
         )
 
@@ -411,6 +440,7 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
         "tasks": first.get("tasks", []),
         "constraints": first.get("constraints", []),
         "alternatives": [],
+        "backtracking": {},
     }
     if first.get("reason") is not None:
         base["reason"] = first["reason"]
@@ -419,61 +449,113 @@ def apply_plan_confidence_policy(ranked_plans: List[Dict[str, Any]]) -> Dict[str
     if first_status in ("unsupported", "none"):
         return base
 
+    def _diff(a, b):
+        return round(a - b, 4)
+
     if c1 > 0.95:
         base["confidence"] = 1.0
         base["status"] = "ok"
         return base
 
-    alternatives: List[Dict[str, Any]] = []
+    if c1 > 0.90:
+        # Tier 2: check if close competitors can be localized to single steps.
+        # If there are close full-plan competitors that differ in >1 step or
+        # constraints, we mark needs_review because they cannot be expressed
+        # as simple backtracking candidates.
+        has_non_localizable = False
+        if len(ranked_plans) >= 2:
+            c2 = ranked_plans[1].get("confidence", 0.0)
+            if _diff(c1, c2) < 0.15:
+                # A close competitor exists at plan level.
+                # For now, conservatively mark needs_review if we haven't
+                # yet verified it can be localized (that happens later).
+                has_non_localizable = True
+        if len(ranked_plans) >= 3:
+            c3 = ranked_plans[2].get("confidence", 0.0)
+            if _diff(c1, c3) < 0.15:
+                has_non_localizable = True
+        base["status"] = "needs_review" if has_non_localizable else "ok"
+    else:
+        # Tier 3: always needs_review at plan level
+        base["status"] = "needs_review"
+
+    return base
+
+
+def apply_step_candidate_policy(
+    step_confidences: List[Dict[str, Any]],
+    candidate_confidences: List[Dict[str, Any]],
+    step_pools: Dict[int, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """
+    Apply per-step confidence policy to decide which candidates to keep
+    in backtracking.step_candidates.
+
+    Rules per step:
+    - C1 > 0.95: no candidates saved
+    - 0.90 < C1 <= 0.95: save candidates where C1 - Cn < 0.15
+    - C1 <= 0.90: save candidates where C1 - Cn < 0.20
+    - Max 2 candidates per step (rank 2, rank 3)
+
+    Returns:
+        {"step_candidates": [{"step_id": int, "candidates": [...]}]}
+    """
+    import json
 
     def _diff(a, b):
         return round(a - b, 4)
 
-    if c1 > 0.90:
-        # Tier 2
-        if len(ranked_plans) >= 2:
-            c2 = ranked_plans[1].get("confidence", 0.0)
-            if _diff(c1, c2) < 0.15:
-                alternatives.append({
-                    "rank": 2,
-                    "confidence": c2,
-                    "tasks": ranked_plans[1].get("tasks", []),
-                    "constraints": ranked_plans[1].get("constraints", []),
-                })
-        if len(ranked_plans) >= 3:
-            c3 = ranked_plans[2].get("confidence", 0.0)
-            if _diff(c1, c3) < 0.15:
-                alternatives.append({
-                    "rank": 3,
-                    "confidence": c3,
-                    "tasks": ranked_plans[2].get("tasks", []),
-                    "constraints": ranked_plans[2].get("constraints", []),
-                })
-        base["status"] = "ok" if not alternatives else "needs_review"
-    else:
-        # Tier 3
-        if len(ranked_plans) >= 2:
-            c2 = ranked_plans[1].get("confidence", 0.0)
-            if _diff(c1, c2) < 0.20:
-                alternatives.append({
-                    "rank": 2,
-                    "confidence": c2,
-                    "tasks": ranked_plans[1].get("tasks", []),
-                    "constraints": ranked_plans[1].get("constraints", []),
-                })
-        if len(ranked_plans) >= 3:
-            c3 = ranked_plans[2].get("confidence", 0.0)
-            if _diff(c1, c3) < 0.20:
-                alternatives.append({
-                    "rank": 3,
-                    "confidence": c3,
-                    "tasks": ranked_plans[2].get("tasks", []),
-                    "constraints": ranked_plans[2].get("constraints", []),
-                })
-        base["status"] = "needs_review"
+    # Map step_id -> primary confidence
+    primary_conf: Dict[int, float] = {}
+    for sc in step_confidences:
+        sid = sc.get("step_id")
+        if sid is not None:
+            primary_conf[sid] = float(sc.get("confidence", 0.0))
 
-    base["alternatives"] = alternatives
-    return base
+    # Map (step_id, rank) -> candidate confidence
+    cand_conf: Dict[tuple, float] = {}
+    for cc in candidate_confidences:
+        sid = cc.get("step_id")
+        rank = cc.get("rank")
+        if sid is not None and rank is not None:
+            cand_conf[(sid, rank)] = float(cc.get("confidence", 0.0))
+
+    step_candidates: List[Dict[str, Any]] = []
+
+    for step_id in sorted(step_pools.keys()):
+        c1 = primary_conf.get(step_id, 1.0)
+        pool = step_pools[step_id]
+
+        if c1 > 0.95:
+            continue
+
+        if c1 > 0.90:
+            margin = 0.15
+        else:
+            margin = 0.20
+
+        kept: List[Dict[str, Any]] = []
+        for rank, cand_task in enumerate(pool, start=2):
+            if rank > 3:
+                break
+            conf = cand_conf.get((step_id, rank), 0.0)
+            if _diff(c1, conf) < margin:
+                kept.append({
+                    "rank": rank,
+                    "step_id": step_id,
+                    "action": cand_task.get("action", "UNKNOWN"),
+                    "direction": cand_task.get("direction"),
+                    "features": cand_task.get("features", []),
+                    "confidence": conf,
+                })
+
+        if kept:
+            step_candidates.append({
+                "step_id": step_id,
+                "candidates": kept,
+            })
+
+    return {"step_candidates": step_candidates}
 
 
 def _merge_sentence_results(
@@ -488,8 +570,7 @@ def _merge_sentence_results(
     - Tasks: concatenated with renumbered step_ids
     - Constraints: union of all constraints
     - Confidence: minimum confidence across sentences (capped at 1.0)
-    - Alternatives: generate full-plan alternatives by substituting one sentence's
-      alternative at a time; max 2 full-plan alternatives (rank 2/3).
+    - Backtracking: renumber step_ids in step_candidates
     """
     if not sentence_results:
         return _make_compact_result(
@@ -497,7 +578,7 @@ def _merge_sentence_results(
             confidence=0.0,
             tasks=[],
             constraints=[],
-            alternatives=[],
+            backtracking={},
             reason="no_action",
         )
 
@@ -508,7 +589,6 @@ def _merge_sentence_results(
         final_reason = "vertical_motion_not_supported"
     elif any(s == "needs_review" for s in statuses):
         final_status = "needs_review"
-        # Collect reasons from failing chunks
         reasons = []
         for r in sentence_results:
             if r.get("status") == "needs_review" and r.get("reason"):
@@ -552,89 +632,41 @@ def _merge_sentence_results(
     if final_status in ("unsupported", "none"):
         merged_tasks = []
 
-    # Build base merged result
+    # Merge backtracking: renumber step_ids
+    merged_backtracking: Dict[str, Any] = {"step_candidates": []}
+    offset = 0
+    for r in sentence_results:
+        tasks = r.get("tasks", [])
+        bt = r.get("backtracking", {})
+        for group in bt.get("step_candidates", []):
+            new_group = {
+                "step_id": group["step_id"] + offset,
+                "candidates": [],
+            }
+            for cand in group.get("candidates", []):
+                new_cand = dict(cand)
+                new_cand["step_id"] = cand["step_id"] + offset
+                new_group["candidates"].append(new_cand)
+            merged_backtracking["step_candidates"].append(new_group)
+        if tasks:
+            offset += len(tasks)
+
     merged: Dict[str, Any] = {
         "status": final_status,
         "confidence": round(merged_confidence, 2),
         "tasks": merged_tasks,
         "constraints": merged_constraints,
-        "alternatives": [],
+        "backtracking": merged_backtracking,
     }
     if final_reason is not None:
         merged["reason"] = final_reason
 
-    # Alternative generation: replace one sentence at a time
-    # Gather (sentence_idx, alt) pairs from sentence-level alternatives
-    alt_slots: List[tuple] = []
-    for sent_idx, r in enumerate(sentence_results):
-        for alt in r.get("alternatives", []):
-            rank = alt.get("rank")
-            if rank in (2, 3):
-                alt_slots.append((sent_idx, rank, alt))
-
-    # Sort by rank ascending (rank 2 before rank 3)
-    alt_slots.sort(key=lambda x: x[1])
-
-    # Build full-plan alternatives, replacing one sentence at a time
-    full_plan_alts: List[Dict[str, Any]] = []
-    used_ranks: set = set()
-    for sent_idx, rank, alt in alt_slots:
-        if rank in used_ranks:
-            continue
-        # Build full plan by substituting this sentence's alternative
-        alt_tasks: List[Dict[str, Any]] = []
-        alt_constraints: List[Dict[str, Any]] = []
-        alt_confs: List[float] = []
-        offset = 0
-        for i, r in enumerate(sentence_results):
-            if i == sent_idx:
-                tasks = alt.get("tasks", [])
-                conf = alt.get("confidence", 0.0)
-            else:
-                tasks = r.get("tasks", [])
-                conf = r.get("confidence", 0.0)
-            for t in tasks:
-                new_task = dict(t)
-                new_task["step_id"] = t.get("step_id", 1) + offset
-                alt_tasks.append(new_task)
-            if tasks:
-                offset += len(tasks)
-            if i == sent_idx:
-                alt_constraints.extend(alt.get("constraints", []))
-            else:
-                alt_constraints.extend(r.get("constraints", []))
-            alt_confs.append(conf)
-
-        # Deduplicate constraints
-        seen: set = set()
-        deduped_constraints: List[Dict[str, Any]] = []
-        for c in alt_constraints:
-            key = json.dumps(c, sort_keys=True)
-            if key not in seen:
-                seen.add(key)
-                deduped_constraints.append(c)
-
-        full_plan_alts.append({
-            "rank": rank,
-            "confidence": min(alt_confs) if alt_confs else 0.0,
-            "tasks": alt_tasks,
-            "constraints": deduped_constraints,
-        })
-        used_ranks.add(rank)
-
-    merged["alternatives"] = full_plan_alts[:2]
-
-    # Validator bans alternatives on ok status; downgrade preemptively
-    if merged["alternatives"] and merged["status"] == "ok":
-        merged["status"] = "needs_review"
-
     try:
         validate_result(merged)
     except ValueError:
-        # Degrade to needs_review if merged plan is invalid
         merged["status"] = "needs_review"
         merged["reason"] = "sentence_chunk_requires_review"
-        merged["alternatives"] = []
+        merged["backtracking"] = {}
 
     return merged
 
@@ -644,7 +676,7 @@ def _make_compact_result(
     confidence: float,
     tasks: List[Dict[str, Any]],
     constraints: List[Dict[str, Any]],
-    alternatives: List[Dict[str, Any]],
+    backtracking: Dict[str, Any],
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a compact result dict."""
@@ -653,7 +685,8 @@ def _make_compact_result(
         "confidence": round(confidence, 2),
         "tasks": tasks,
         "constraints": constraints,
-        "alternatives": alternatives,
+        "alternatives": [],
+        "backtracking": backtracking,
     }
     if reason is not None:
         result["reason"] = reason

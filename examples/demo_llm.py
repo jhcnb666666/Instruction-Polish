@@ -70,6 +70,18 @@ def main():
         if result.get("alternatives"):
             print(f"  alternatives: {len(result['alternatives'])} plan(s)")
 
+        bt = result.get("backtracking", {})
+        step_candidates = bt.get("step_candidates", [])
+        if step_candidates:
+            print(f"  backtracking: {len(step_candidates)} step group(s)")
+            for group in step_candidates:
+                sid = group["step_id"]
+                for cand in group.get("candidates", []):
+                    dir_part = f" dir={cand['direction']}" if cand.get("direction") else ""
+                    print(
+                        f"    -> Step {sid} rank={cand['rank']}: {cand['action']}{dir_part}"
+                    )
+
     print("\n" + "=" * 70)
     print("Full JSON output for last sample:")
     print("=" * 70)

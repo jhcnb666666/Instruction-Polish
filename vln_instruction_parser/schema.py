@@ -38,12 +38,34 @@ class AlternativePlan:
 
 
 @dataclass
+class BacktrackingCandidate:
+    rank: int
+    step_id: int
+    action: str
+    features: List[Feature] = field(default_factory=list)
+    direction: Optional[str] = None
+    confidence: float = 1.0
+
+
+@dataclass
+class StepCandidateGroup:
+    step_id: int
+    candidates: List[BacktrackingCandidate] = field(default_factory=list)
+
+
+@dataclass
+class BacktrackingResult:
+    step_candidates: List[StepCandidateGroup] = field(default_factory=list)
+
+
+@dataclass
 class ParseResult:
     status: str
     confidence: float
     tasks: List[Task] = field(default_factory=list)
     constraints: List[Constraint] = field(default_factory=list)
     alternatives: List[AlternativePlan] = field(default_factory=list)
+    backtracking: BacktrackingResult = field(default_factory=BacktrackingResult)
     reason: Optional[str] = None
 
 
@@ -127,6 +149,56 @@ def alternative_plan_from_dict(d: dict) -> AlternativePlan:
     )
 
 
+def backtracking_candidate_to_dict(bc: BacktrackingCandidate) -> dict:
+    d: Dict[str, object] = {
+        "rank": bc.rank,
+        "step_id": bc.step_id,
+        "action": bc.action,
+        "features": [_feature_to_dict(f) for f in bc.features],
+        "confidence": round(bc.confidence, 2),
+    }
+    if bc.direction is not None:
+        d["direction"] = bc.direction
+    return d
+
+
+def backtracking_candidate_from_dict(d: dict) -> BacktrackingCandidate:
+    return BacktrackingCandidate(
+        rank=d["rank"],
+        step_id=d["step_id"],
+        action=d["action"],
+        direction=d.get("direction"),
+        confidence=d.get("confidence", 1.0),
+        features=[_feature_from_dict(f) for f in d.get("features", [])],
+    )
+
+
+def step_candidate_group_to_dict(g: StepCandidateGroup) -> dict:
+    return {
+        "step_id": g.step_id,
+        "candidates": [backtracking_candidate_to_dict(c) for c in g.candidates],
+    }
+
+
+def step_candidate_group_from_dict(d: dict) -> StepCandidateGroup:
+    return StepCandidateGroup(
+        step_id=d["step_id"],
+        candidates=[backtracking_candidate_from_dict(c) for c in d.get("candidates", [])],
+    )
+
+
+def backtracking_result_to_dict(bt: BacktrackingResult) -> dict:
+    return {
+        "step_candidates": [step_candidate_group_to_dict(g) for g in bt.step_candidates],
+    }
+
+
+def backtracking_result_from_dict(d: dict) -> BacktrackingResult:
+    return BacktrackingResult(
+        step_candidates=[step_candidate_group_from_dict(g) for g in d.get("step_candidates", [])],
+    )
+
+
 def result_to_dict(result: ParseResult) -> dict:
     d: Dict[str, object] = {
         "status": result.status,
@@ -134,6 +206,7 @@ def result_to_dict(result: ParseResult) -> dict:
         "tasks": [task_to_dict(t) for t in result.tasks],
         "constraints": [constraint_to_dict(c) for c in result.constraints],
         "alternatives": [alternative_plan_to_dict(a) for a in result.alternatives],
+        "backtracking": backtracking_result_to_dict(result.backtracking),
     }
     if result.reason is not None:
         d["reason"] = result.reason
@@ -147,5 +220,6 @@ def result_from_dict(d: dict) -> ParseResult:
         tasks=[task_from_dict(t) for t in d.get("tasks", [])],
         constraints=[constraint_from_dict(c) for c in d.get("constraints", [])],
         alternatives=[alternative_plan_from_dict(a) for a in d.get("alternatives", [])],
+        backtracking=backtracking_result_from_dict(d.get("backtracking", {})),
         reason=d.get("reason"),
     )

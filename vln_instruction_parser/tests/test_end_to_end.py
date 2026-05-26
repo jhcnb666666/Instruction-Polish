@@ -14,6 +14,9 @@ from vln_instruction_parser.schema import (
     Feature,
     Constraint,
     AlternativePlan,
+    BacktrackingResult,
+    StepCandidateGroup,
+    BacktrackingCandidate,
     result_to_dict,
     result_from_dict,
 )
@@ -32,9 +35,10 @@ def _plan(confidence, tasks=None, constraints=None):
 class TestVerifierIntegration:
     """Verifier reranker drives confidence policy decisions."""
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_096_ok_no_alternatives(self, mock_parse, mock_verify):
+    def test_verifier_c1_096_ok_no_backtracking(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -42,15 +46,21 @@ class TestVerifierIntegration:
         mock_verify.return_value = [
             {"candidate_id": "p1", "confidence": 0.96},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [{"step_id": 1, "confidence": 0.97}],
+            "candidate_confidences": [],
+        }
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "ok"
         assert result["confidence"] == 1.0
         assert result["alternatives"] == []
+        assert result.get("backtracking", {}) == {"step_candidates": []}
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_095_c2_081_save_rank2(self, mock_parse, mock_verify):
+    def test_verifier_c1_095_c2_081_needs_review(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -64,15 +74,21 @@ class TestVerifierIntegration:
             {"candidate_id": "p1", "confidence": 0.95},
             {"candidate_id": "p2", "confidence": 0.81},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [{"step_id": 1, "confidence": 0.95}],
+            "candidate_confidences": [{"step_id": 1, "rank": 2, "confidence": 0.81}],
+        }
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
+        # Close competitor at plan level => needs_review
         assert result["status"] == "needs_review"
-        assert len(result["alternatives"]) == 1
-        assert result["alternatives"][0]["rank"] == 2
+        assert result["alternatives"] == []
+        # Backtracking may contain the local candidate if step verifier passed
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_095_c2_080_no_save(self, mock_parse, mock_verify):
+    def test_verifier_c1_095_c2_080_ok(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -86,15 +102,20 @@ class TestVerifierIntegration:
             {"candidate_id": "p1", "confidence": 0.95},
             {"candidate_id": "p2", "confidence": 0.80},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [{"step_id": 1, "confidence": 0.95}],
+            "candidate_confidences": [],
+        }
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
-        # 0.95 - 0.80 = 0.15, NOT strictly < 0.15, so no save
+        # 0.95 - 0.80 = 0.15, NOT strictly < 0.15, so ok
         assert result["status"] == "ok"
         assert result["alternatives"] == []
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_090_c2_071_save_rank2_only(self, mock_parse, mock_verify):
+    def test_verifier_c1_090_c2_071_needs_review(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "MOVE_FORWARD", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -108,15 +129,25 @@ class TestVerifierIntegration:
             {"candidate_id": "p2", "confidence": 0.71},
             {"candidate_id": "p3", "confidence": 0.69},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [
+                {"step_id": 1, "confidence": 0.92},
+                {"step_id": 2, "confidence": 0.88},
+                {"step_id": 3, "confidence": 0.90},
+            ],
+            "candidate_confidences": [
+                {"step_id": 1, "rank": 2, "confidence": 0.71},
+            ],
+        }
         result = parse_instruction_llm("Go straight then turn left and stop.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "needs_review"
-        assert len(result["alternatives"]) == 1
-        assert result["alternatives"][0]["rank"] == 2
+        assert result["alternatives"] == []
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_089_c2_075_c3_070_save_both(self, mock_parse, mock_verify):
+    def test_verifier_c1_089_c2_075_c3_070_needs_review(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "MOVE_FORWARD", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -130,16 +161,26 @@ class TestVerifierIntegration:
             {"candidate_id": "p2", "confidence": 0.75},
             {"candidate_id": "p3", "confidence": 0.70},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [
+                {"step_id": 1, "confidence": 0.90},
+                {"step_id": 2, "confidence": 0.88},
+                {"step_id": 3, "confidence": 0.89},
+            ],
+            "candidate_confidences": [
+                {"step_id": 1, "rank": 2, "confidence": 0.75},
+                {"step_id": 1, "rank": 3, "confidence": 0.70},
+            ],
+        }
         result = parse_instruction_llm("Go straight then turn left and stop.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "needs_review"
-        assert len(result["alternatives"]) == 2
-        ranks = {a["rank"] for a in result["alternatives"]}
-        assert ranks == {2, 3}
+        assert result["alternatives"] == []
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_failure_degradation(self, mock_parse, mock_verify):
+    def test_verifier_failure_degradation(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -151,15 +192,14 @@ class TestVerifierIntegration:
         assert result["status"] == "needs_review"
         assert result["confidence"] == 0.0
         assert result.get("reason") == "confidence_verification_unavailable"
-        # Alternatives should include the second candidate
-        assert len(result["alternatives"]) >= 1
-        assert result["alternatives"][0]["confidence"] == 0.0
+        assert result["alternatives"] == []
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_alternatives_preserve_terminate_and_constraints(self, mock_parse, mock_verify):
-        """Alternatives must preserve full tasks and constraints."""
+    def test_backtracking_preserve_terminate_and_constraints(self, mock_parse, mock_verify, mock_step_verify):
+        """Main plan must preserve full tasks and constraints."""
         mock_parse.return_value = (True, [
             {"actions": [
                 {"id": "a1", "action": "MOVE_FORWARD", "features": [
@@ -178,20 +218,23 @@ class TestVerifierIntegration:
             {"candidate_id": "p1", "confidence": 0.92},
             {"candidate_id": "p2", "confidence": 0.83},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [{"step_id": 1, "confidence": 0.92}],
+            "candidate_confidences": [{"step_id": 1, "rank": 2, "confidence": 0.83}],
+        }
         result = parse_instruction_llm("Go to the door.", fallback_to_rules=False, vote_count=2)
         assert result["status"] == "needs_review"
         # Main plan has terminate feature and constraint
         assert any(f.get("role") == "terminate" for f in result["tasks"][0].get("features", []))
         assert len(result["constraints"]) == 1
-        # Alternative also preserved
-        alt = result["alternatives"][0]
-        assert len(alt["tasks"]) == 1
-        assert alt["tasks"][0]["action"] == "TURN"
+        # No full-plan alternatives anymore
+        assert result["alternatives"] == []
         validate_result(result)
 
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_three_different_votes_kept(self, mock_parse, mock_verify):
+    def test_three_different_votes_kept(self, mock_parse, mock_verify, mock_step_verify):
         """All three votes different -> all three candidates enter verifier."""
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "MOVE_FORWARD", "features": []}],
@@ -206,9 +249,16 @@ class TestVerifierIntegration:
             {"candidate_id": "p2", "confidence": 0.75},
             {"candidate_id": "p3", "confidence": 0.70},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [{"step_id": 1, "confidence": 0.88}],
+            "candidate_confidences": [
+                {"step_id": 1, "rank": 2, "confidence": 0.75},
+                {"step_id": 1, "rank": 3, "confidence": 0.70},
+            ],
+        }
         result = parse_instruction_llm("Do something.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "needs_review"
-        assert len(result["alternatives"]) == 2
+        assert result["alternatives"] == []
         validate_result(result)
 
 
@@ -272,7 +322,7 @@ class TestSemanticCompilerExcludedVertical:
 
 
 class TestSchemaRoundtrip:
-    def test_result_with_alternatives_and_constraints_roundtrip(self):
+    def test_result_with_backtracking_roundtrip(self):
         result = ParseResult(
             status="needs_review",
             confidence=0.93,
@@ -287,14 +337,24 @@ class TestSchemaRoundtrip:
             constraints=[
                 Constraint(type="forbidden_action", action="ENTER", features=[])
             ],
-            alternatives=[
-                AlternativePlan(
-                    rank=2,
-                    confidence=0.84,
-                    tasks=[Task(step_id=1, action="TURN", direction="left", features=[], confidence=0.82)],
-                    constraints=[],
-                )
-            ],
+            alternatives=[],
+            backtracking=BacktrackingResult(
+                step_candidates=[
+                    StepCandidateGroup(
+                        step_id=1,
+                        candidates=[
+                            BacktrackingCandidate(
+                                rank=2,
+                                step_id=1,
+                                action="TURN",
+                                direction="left",
+                                features=[],
+                                confidence=0.82,
+                            )
+                        ],
+                    )
+                ]
+            ),
         )
         d = result_to_dict(result)
         validate_result(d)
@@ -303,14 +363,16 @@ class TestSchemaRoundtrip:
         assert back.confidence == 0.93
         assert len(back.tasks) == 1
         assert len(back.constraints) == 1
-        assert len(back.alternatives) == 1
-        assert back.alternatives[0].rank == 2
+        assert len(back.alternatives) == 0
+        assert len(back.backtracking.step_candidates) == 1
+        assert back.backtracking.step_candidates[0].candidates[0].rank == 2
 
 
 class TestNoInternalMetadataInOutput:
+    @patch("vln_instruction_parser.llm.verify_step_candidates")
     @patch("vln_instruction_parser.llm.verify_candidate_plans")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_output_has_no_raw_text_or_candidate_id(self, mock_parse, mock_verify):
+    def test_output_has_no_raw_text_or_candidate_id(self, mock_parse, mock_verify, mock_step_verify):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -318,6 +380,10 @@ class TestNoInternalMetadataInOutput:
         mock_verify.return_value = [
             {"candidate_id": "p1", "confidence": 0.96},
         ]
+        mock_step_verify.return_value = {
+            "step_confidences": [{"step_id": 1, "confidence": 0.97}],
+            "candidate_confidences": [],
+        }
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
         # Forbidden keys must not appear
         forbidden = {"raw_text", "original_instruction", "canonical_instruction",
@@ -326,8 +392,10 @@ class TestNoInternalMetadataInOutput:
         assert not (forbidden & result_keys)
         for task in result.get("tasks", []):
             assert not (forbidden & set(task.keys()))
-        for alt in result.get("alternatives", []):
-            assert not (forbidden & set(alt.keys()))
+        for group in result.get("backtracking", {}).get("step_candidates", []):
+            assert not (forbidden & set(group.keys()))
+            for cand in group.get("candidates", []):
+                assert not (forbidden & set(cand.keys()))
         validate_result(result)
 
 

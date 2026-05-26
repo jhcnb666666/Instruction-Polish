@@ -63,26 +63,34 @@ def split_sentences_for_llm(text: str) -> List[str]:
     if not cleaned:
         return []
 
-    # Protect abbreviations by temporarily replacing their trailing period
+    # Protect abbreviations by temporarily replacing their trailing period.
+    # Use re.sub with a replacer function to avoid index corruption when
+    # multiple abbreviations appear in the text.
     protected = cleaned
     placeholders: List[Tuple[str, str]] = []
     placeholder_idx = 0
 
+    def _abbrev_replacer(match: "re.Match[str]") -> str:
+        nonlocal placeholder_idx
+        ph = f"\x00ABBREV{placeholder_idx}\x00"
+        placeholders.append((ph, match.group(0)))
+        placeholder_idx += 1
+        return ph
+
     # Match abbreviations as whole words (case-insensitive)
     for abbrev in ABBREVIATIONS:
         pattern = rf"\b{re.escape(abbrev)}\."
-        for match in re.finditer(pattern, protected, flags=re.IGNORECASE):
-            ph = f"\x00ABBREV{placeholder_idx}\x00"
-            placeholders.append((ph, match.group(0)))
-            protected = protected[:match.start()] + ph + protected[match.end():]
-            placeholder_idx += 1
+        protected = re.sub(pattern, _abbrev_replacer, protected, flags=re.IGNORECASE)
 
-    # Also protect decimal numbers like "3.14"
-    for match in re.finditer(r"\d+\.\d+", protected):
+    def _decimal_replacer(match: "re.Match[str]") -> str:
+        nonlocal placeholder_idx
         ph = f"\x00DECIMAL{placeholder_idx}\x00"
         placeholders.append((ph, match.group(0)))
-        protected = protected[:match.start()] + ph + protected[match.end():]
         placeholder_idx += 1
+        return ph
+
+    # Also protect decimal numbers like "3.14"
+    protected = re.sub(r"\d+\.\d+", _decimal_replacer, protected)
 
     # Split on sentence-ending punctuation followed by space or end
     raw_parts = re.split(r'(?<=[.!?])(?:\s+|$)', protected)

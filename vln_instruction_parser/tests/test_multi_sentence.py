@@ -143,30 +143,38 @@ class TestMergeSentenceResults:
         merged = _merge_sentence_results([r1, r2], "Walk forward. Turn left.")
         assert len(merged["constraints"]) == 1  # deduped
 
-    def test_alternative_generation(self):
+    def test_backtracking_merge(self):
         r1 = {
             "status": "ok", "confidence": 0.95,
             "tasks": [{"step_id": 1, "action": "MOVE_FORWARD", "features": []}],
             "constraints": [],
-            "alternatives": [
-                {"rank": 2, "confidence": 0.85, "tasks": [{"step_id": 1, "action": "TURN", "direction": "right", "features": []}], "constraints": []}
-            ],
+            "backtracking": {
+                "step_candidates": [
+                    {
+                        "step_id": 1,
+                        "candidates": [
+                            {"rank": 2, "step_id": 1, "action": "TURN", "direction": "right", "features": [], "confidence": 0.85}
+                        ],
+                    }
+                ]
+            },
         }
         r2 = {
             "status": "ok", "confidence": 0.93,
             "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
             "constraints": [],
-            "alternatives": [],
+            "backtracking": {"step_candidates": []},
         }
         merged = _merge_sentence_results([r1, r2], "Walk forward. Turn left.")
-        assert len(merged["alternatives"]) == 1
-        alt = merged["alternatives"][0]
-        assert alt["rank"] == 2
-        assert len(alt["tasks"]) == 2
-        assert alt["tasks"][0]["action"] == "TURN"
-        assert alt["tasks"][0]["direction"] == "right"
-        assert alt["tasks"][1]["action"] == "TURN"
-        assert alt["tasks"][1]["direction"] == "left"
+        bt = merged.get("backtracking", {})
+        assert len(bt.get("step_candidates", [])) == 1
+        group = bt["step_candidates"][0]
+        assert group["step_id"] == 1
+        assert len(group["candidates"]) == 1
+        cand = group["candidates"][0]
+        assert cand["rank"] == 2
+        assert cand["action"] == "TURN"
+        assert cand["direction"] == "right"
 
     def test_empty_results(self):
         merged = _merge_sentence_results([], "")
@@ -185,7 +193,7 @@ class TestParseInstructionAutoMultiSentence:
                 {"step_id": 1, "action": "MOVE_FORWARD", "features": [], "confidence": 1.0}
             ],
             "constraints": [],
-            "alternatives": [],
+            "backtracking": {"step_candidates": []},
         }
         result = parse_instruction_auto("Walk to the door. Then turn when you see it.")
         mock_llm.assert_called_once()
@@ -238,7 +246,9 @@ class TestParseInstructionAutoMultiSentence:
         assert result["status"] == "ok"
         assert result["tasks"] == []
 
-    def test_preflight_vertical_motion(self):
-        result = parse_instruction_auto("Go upstairs and turn left.")
+    def test_rule_path_vertical_motion(self):
+        """Rule path still rejects active vertical motion preflight."""
+        from vln_instruction_parser.parser import parse_instruction
+        result = parse_instruction("Go upstairs and turn left.")
         assert result["status"] == "unsupported"
         assert result["reason"] == "vertical_motion_not_supported"

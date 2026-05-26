@@ -220,11 +220,17 @@ def _unsupported(reason: str) -> Dict[str, Any]:
 
 
 def _normalize_features(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Normalize and deduplicate features, removing empty optional fields."""
+    """Normalize and deduplicate features, removing empty optional fields.
+
+    Skips malformed features that lack a ``role`` key.
+    """
     seen: Set[str] = set()
     out: List[Dict[str, Any]] = []
     for f in features:
-        nf: Dict[str, Any] = {"role": f["role"]}
+        role = f.get("role")
+        if role is None:
+            continue
+        nf: Dict[str, Any] = {"role": role}
         if f.get("relation"):
             nf["relation"] = f["relation"]
         if f.get("landmark"):
