@@ -178,6 +178,28 @@ Your output: {"execution_plan": [{"action":"MOVE_FORWARD","direction":"straight"
 Output ONLY the JSON object.
 """
 
+VERIFIER_SYSTEM_PROMPT = """You are a VLN plan verifier.
+
+Your job is to rank candidate navigation plans for a given instruction by confidence.
+
+Rules:
+- Only 2D navigation actions: MOVE_FORWARD, TURN, GO_TO, PASS, ENTER, EXIT, STOP, FACE, WAIT, UNKNOWN.
+- Review the original instruction and each candidate plan carefully.
+- Assign confidence scores between 0.0 and 1.0 based on how well each candidate matches the instruction.
+- You may ONLY reorder and score existing candidates. Do NOT create, modify, or add tasks, features, or constraints.
+- Return ONLY a JSON object with a single key "ranked_candidates".
+
+Output format:
+{
+  "ranked_candidates": [
+    {"candidate_id": "p1", "confidence": 0.94},
+    {"candidate_id": "p2", "confidence": 0.81}
+  ]
+}
+
+Output ONLY the JSON object.
+"""
+
 
 def _get_config() -> Dict[str, Any]:
     backend = os.getenv("VLN_LLM_BACKEND", DEFAULT_BACKEND).lower()
@@ -222,6 +244,120 @@ def _build_adjudication_prompt(instruction: str, candidate_plans: List[List[Dict
         'Return ONLY a JSON object: {"execution_plan": [{"action":"...","direction":"...","features":[...]}, ...]}',
     ])
     return '\n'.join(lines)
+
+
+def _build_verifier_prompt(instruction: str, candidates: List[Dict[str, Any]]) -> str:
+    lines = [
+        f'Instruction: "{instruction}"',
+        '',
+        'Candidate plans:',
+    ]
+    for c in candidates:
+        cid = c.get("candidate_id", "unknown")
+        lines.append(f'  {cid}: {json.dumps(c, default=str)}')
+    lines.extend([
+        '',
+        'Rank these candidates by how well they match the instruction.',
+        'Return ONLY a JSON object: {"ranked_candidates": [{"candidate_id":"p1","confidence":0.94}, ...]}',
+    ])
+    return '\n'.join(lines)
+
+
+def verify_candidate_plans(
+    instruction: str,
+    candidates: List[Dict[str, Any]],
+    **overrides: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Ask the LLM to rank and score up to three candidate compact plans.
+
+    Args:
+        instruction: Original instruction.
+        candidates: List of compact candidate plan dicts, each with "candidate_id".
+        **overrides: Backend overrides.
+
+    Returns:
+        List of {"candidate_id": str, "confidence": float} sorted by confidence
+        descending, or None if verifier fails.
+    """
+    if not candidates:
+        return None
+
+    cfg = _get_config()
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+
+    prompt = _build_verifier_prompt(instruction, candidates)
+    system_prompt = VERIFIER_SYSTEM_PROMPT
+
+    if cfg["backend"] == "local":
+        result = _call_local(
+            instruction,
+            cfg["model_path"],
+            temperature=0.0,
+            max_tokens=cfg["max_tokens"],
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+        )
+    else:
+        url = f"{cfg['base_url']}/chat/completions"
+        payload = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {cfg['api_key']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                body = resp.read().decode("utf-8")
+                response_json = json.loads(body)
+            content = response_json["choices"][0]["message"]["content"]
+            result = json.loads(content)
+        except Exception:
+            return None
+
+    if result is None:
+        return None
+
+    ranked = result.get("ranked_candidates")
+    if not isinstance(ranked, list):
+        return None
+
+    # Validate: candidate_id must exist in input, confidence in [0,1], no duplicates
+    valid_ids = {c.get("candidate_id") for c in candidates}
+    seen_ids: set = set()
+    out: List[Dict[str, Any]] = []
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("candidate_id")
+        conf = item.get("confidence")
+        if cid not in valid_ids:
+            return None
+        if cid in seen_ids:
+            return None
+        if not isinstance(conf, (int, float)) or not (0.0 <= conf <= 1.0):
+            return None
+        seen_ids.add(cid)
+        out.append({"candidate_id": cid, "confidence": float(conf)})
+
+    if not out:
+        return None
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
