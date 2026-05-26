@@ -267,7 +267,7 @@ class TestSemanticCompilerExcludedVertical:
             "excluded": [],
         }
         result = compile_draft(draft)
-        assert result["status"] == "unsupported"
+        assert result["status"] == "needs_review"
         assert result.get("reason") == "cyclic_execution_order"
 
 
