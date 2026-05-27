@@ -19,7 +19,9 @@ class TestStepFeatures:
     def test_go_straight_until_door_terminate(self):
         """Go straight until you reach the door -> terminate feature (LLM path)."""
         from unittest.mock import patch
-        with patch("vln_instruction_parser.llm._call_backend") as mock_call:
+        with patch("vln_instruction_parser.llm._call_backend") as mock_call, \
+             patch("vln_instruction_parser.llm.audit_plans_against_instruction") as mock_audit, \
+             patch("vln_instruction_parser.llm.generate_step_candidates") as mock_gen:
             mock_call.return_value = {
                 "actions": [
                     {"id": "a1", "action": "MOVE_FORWARD", "direction": "straight", "features": [
@@ -30,6 +32,8 @@ class TestStepFeatures:
                 "constraints": [],
                 "excluded": [],
             }
+            mock_audit.return_value = [{"candidate_id": "p1", "plan_confidence": 0.96, "blocking_issues": [], "step_confidences": [{"step_id": 1, "confidence": 0.96}]}]
+            mock_gen.return_value = {}
             result = parse_instruction_llm("Go straight until you reach the door.", vote_count=3)
         t = result["tasks"][0]
         terminate = next((f for f in t.get("features", []) if f["role"] == "terminate"), None)
@@ -39,7 +43,9 @@ class TestStepFeatures:
     def test_when_see_sofa_turn_left_start(self):
         """When you see the sofa, turn left -> start feature (LLM path)."""
         from unittest.mock import patch
-        with patch("vln_instruction_parser.llm._call_backend") as mock_call:
+        with patch("vln_instruction_parser.llm._call_backend") as mock_call, \
+             patch("vln_instruction_parser.llm.audit_plans_against_instruction") as mock_audit, \
+             patch("vln_instruction_parser.llm.generate_step_candidates") as mock_gen:
             mock_call.return_value = {
                 "actions": [
                     {"id": "a1", "action": "TURN", "direction": "left", "features": [
@@ -50,6 +56,8 @@ class TestStepFeatures:
                 "constraints": [],
                 "excluded": [],
             }
+            mock_audit.return_value = [{"candidate_id": "p1", "plan_confidence": 0.96, "blocking_issues": [], "step_confidences": [{"step_id": 1, "confidence": 0.96}]}]
+            mock_gen.return_value = {}
             result = parse_instruction_llm("When you see the sofa, turn left.", vote_count=3)
         t = result["tasks"][0]
         start = next((f for f in t.get("features", []) if f["role"] == "start"), None)
@@ -59,7 +67,9 @@ class TestStepFeatures:
     def test_follow_hallway_until_sofa_then_turn(self):
         """Adjacent steps with different role for same landmark (LLM path)."""
         from unittest.mock import patch
-        with patch("vln_instruction_parser.llm._call_backend") as mock_call:
+        with patch("vln_instruction_parser.llm._call_backend") as mock_call, \
+             patch("vln_instruction_parser.llm.audit_plans_against_instruction") as mock_audit, \
+             patch("vln_instruction_parser.llm.generate_step_candidates") as mock_gen:
             mock_call.return_value = {
                 "actions": [
                     {"id": "a1", "action": "MOVE_FORWARD", "direction": "straight", "features": [
@@ -74,6 +84,8 @@ class TestStepFeatures:
                 "constraints": [],
                 "excluded": [],
             }
+            mock_audit.return_value = [{"candidate_id": "p1", "plan_confidence": 0.96, "blocking_issues": [], "step_confidences": [{"step_id": 1, "confidence": 0.96}, {"step_id": 2, "confidence": 0.96}]}]
+            mock_gen.return_value = {}
             result = parse_instruction_llm("Follow the hallway until you see the sofa on your left, then turn left at the sofa.", vote_count=3)
         t1 = result["tasks"][0]
         t2 = result["tasks"][1]
@@ -85,7 +97,9 @@ class TestStepFeatures:
     def test_before_turning_right_walk_past_table_order(self):
         """Before turning right at the door, walk past the table."""
         from unittest.mock import patch
-        with patch("vln_instruction_parser.llm._call_backend") as mock_call:
+        with patch("vln_instruction_parser.llm._call_backend") as mock_call, \
+             patch("vln_instruction_parser.llm.audit_plans_against_instruction") as mock_audit, \
+             patch("vln_instruction_parser.llm.generate_step_candidates") as mock_gen:
             mock_call.return_value = {
                 "actions": [
                     {"id": "a1", "action": "PASS", "features": [
@@ -99,6 +113,8 @@ class TestStepFeatures:
                 "constraints": [],
                 "excluded": [],
             }
+            mock_audit.return_value = [{"candidate_id": "p1", "plan_confidence": 0.96, "blocking_issues": [], "step_confidences": [{"step_id": 1, "confidence": 0.96}, {"step_id": 2, "confidence": 0.96}]}]
+            mock_gen.return_value = {}
             result = parse_instruction_llm("Before turning right at the door, walk past the table.", vote_count=3)
         assert result["tasks"][0]["action"] == "PASS"
         assert result["tasks"][1]["action"] == "TURN"

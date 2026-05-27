@@ -47,7 +47,7 @@ class TestRuleFallbackTemporal:
 
     @patch("vln_instruction_parser.llm._call_backend")
     def test_llm_fallback_temporal_returns_needs_review(self, mock_call):
-        """LLM failure on temporal input must fail-closed with needs_review."""
+        """LLM failure on temporal input must retain its actual failure reason."""
         mock_call.return_value = None
         result = parse_instruction_llm(
             "Before turning left, go straight down the hallway.",
@@ -56,6 +56,7 @@ class TestRuleFallbackTemporal:
         )
         assert result["status"] == "needs_review"
         assert result["tasks"] == []
+        assert result["reason"] == "initial_generation_failed"
 
 
 class TestLocalAdjudication:

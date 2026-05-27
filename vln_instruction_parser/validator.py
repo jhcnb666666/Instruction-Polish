@@ -105,6 +105,9 @@ def validate_result(result: Dict[str, Any]) -> None:
     alternatives = result.get("alternatives", [])
     if not isinstance(alternatives, list):
         raise ValueError("alternatives must be a list")
+    # New protocol: alternatives must always be empty
+    if alternatives:
+        raise ValueError("alternatives must be empty in the new protocol")
     seen_ranks: set = set()
     prev_rank = 0
     for alt in alternatives:
@@ -126,10 +129,10 @@ def validate_result(result: Dict[str, Any]) -> None:
     if status == "unsupported":
         if tasks:
             raise ValueError("status=unsupported must have empty tasks")
+        if backtracking.get("step_candidates"):
+            raise ValueError("status=unsupported must have empty backtracking.step_candidates")
 
     if status == "ok":
-        if alternatives:
-            raise ValueError("status=ok must not have alternatives")
         if result.get("reason") is not None:
             raise ValueError("status=ok must not have a reason")
         for task in tasks:
@@ -139,6 +142,8 @@ def validate_result(result: Dict[str, Any]) -> None:
     if status == "none":
         if tasks:
             raise ValueError("status=none should have empty tasks")
+        if backtracking.get("step_candidates"):
+            raise ValueError("status=none must have empty backtracking.step_candidates")
 
 
 def _validate_task(task: Dict[str, Any], expected_step_id: int) -> None:

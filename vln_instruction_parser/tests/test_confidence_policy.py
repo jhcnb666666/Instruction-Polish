@@ -1,7 +1,10 @@
 """Tests for plan-level confidence policy."""
 
 import pytest
-from vln_instruction_parser.parser import apply_plan_confidence_policy
+from vln_instruction_parser.parser import (
+    apply_plan_confidence_policy,
+    apply_step_candidate_policy,
+)
 
 
 def _plan(confidence, tasks=None, constraints=None):
@@ -20,7 +23,7 @@ class TestConfidencePolicyTier1:
         assert result["confidence"] == 1.0
         assert result["status"] == "ok"
         assert result["alternatives"] == []
-        assert result["backtracking"] == {}
+        assert result["backtracking"] == {"step_candidates": []}
 
 
 class TestConfidencePolicyTier2:
@@ -69,3 +72,54 @@ class TestConfidencePolicyTier3:
         assert result["status"] == "none"
         assert result["confidence"] == 0.0
         assert result["reason"] == "no_action"
+
+
+def _candidate(direction):
+    return {"action": "TURN", "direction": direction, "features": []}
+
+
+class TestStepCandidatePolicy:
+    def test_above_095_ignores_candidates(self):
+        result = apply_step_candidate_policy(
+            [{"step_id": 1, "confidence": 0.96}],
+            [{"step_id": 1, "rank": 2, "confidence": 0.96}],
+            {1: [_candidate("right")]},
+        )
+        assert result == {"step_candidates": []}
+
+    def test_medium_tier_includes_040_boundary_and_rejects_beyond_it(self):
+        result = apply_step_candidate_policy(
+            [{"step_id": 1, "confidence": 0.95}],
+            [
+                {"step_id": 1, "rank": 2, "confidence": 0.55},
+                {"step_id": 1, "rank": 3, "confidence": 0.54},
+            ],
+            {1: [_candidate("right"), _candidate("around")]},
+        )
+        candidates = result["step_candidates"][0]["candidates"]
+        assert [candidate["confidence"] for candidate in candidates] == [0.55]
+
+    def test_low_tier_includes_050_boundary_and_rejects_beyond_it(self):
+        result = apply_step_candidate_policy(
+            [{"step_id": 1, "confidence": 0.90}],
+            [
+                {"step_id": 1, "rank": 2, "confidence": 0.40},
+                {"step_id": 1, "rank": 3, "confidence": 0.39},
+            ],
+            {1: [_candidate("right"), _candidate("around")]},
+        )
+        candidates = result["step_candidates"][0]["candidates"]
+        assert [candidate["confidence"] for candidate in candidates] == [0.40]
+
+    def test_saves_only_rank_two_and_three(self):
+        result = apply_step_candidate_policy(
+            [{"step_id": 1, "confidence": 0.90}],
+            [
+                {"step_id": 1, "rank": 2, "confidence": 0.70},
+                {"step_id": 1, "rank": 3, "confidence": 0.65},
+                {"step_id": 1, "rank": 4, "confidence": 0.64},
+            ],
+            {1: [_candidate("right"), _candidate("around"), _candidate("left")]},
+        )
+        candidates = result["step_candidates"][0]["candidates"]
+        assert [candidate["rank"] for candidate in candidates] == [2, 3]

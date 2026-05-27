@@ -54,6 +54,12 @@ def has_active_vertical_motion(text: str) -> bool:
     return False
 
 
+def count_navigation_phases(text: str) -> int:
+    """Count recognizable navigation action stages using the shared heuristic."""
+    words = re.findall(r"\b\w+\b", text.lower())
+    return sum(1 for word in words if word in ACTION_VERBS)
+
+
 def requires_semantic_parser(text: str) -> bool:
     """
     Return True if the instruction has structural or semantic complexity
@@ -88,12 +94,7 @@ def requires_semantic_parser(text: str) -> bool:
         return True
 
     # Structural: three or more action clauses
-    action_count = 0
-    words = re.findall(r"\b\w+\b", lower)
-    for w in words:
-        if w in ACTION_VERBS:
-            action_count += 1
-    if action_count >= 3:
+    if count_navigation_phases(text) >= 3:
         return True
 
     # Active vertical-movement only

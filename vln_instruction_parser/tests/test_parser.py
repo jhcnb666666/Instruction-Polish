@@ -198,6 +198,7 @@ class TestParserLLMFallback:
         text = "Walk to the table."
         result = parse_instruction_llm(text, fallback_to_rules=False)
         assert result["tasks"] == []
+        assert result["reason"] == "initial_generation_failed"
 
     @patch("vln_instruction_parser.llm._call_backend")
     def test_complex_fail_closed_no_fallback(self, mock_call):
@@ -207,3 +208,4 @@ class TestParserLLMFallback:
         result = parse_instruction_llm(text, fallback_to_rules=True)
         assert result["status"] == "needs_review"
         assert result["tasks"] == []
+        assert result["reason"] == "initial_generation_failed"

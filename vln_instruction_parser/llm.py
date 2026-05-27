@@ -9,10 +9,13 @@ Backend is selected via environment variable VLN_LLM_BACKEND.
 """
 
 import json
+import logging
 import os
 import re
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ── Backend selection ──────────────────────────────────────────────────────
 DEFAULT_BACKEND = os.getenv("VLN_LLM_BACKEND", "local")
@@ -35,7 +38,7 @@ Core Rules:
 - Only English input is supported.
 - Only 2D navigation is supported (walk, go, turn, stop, enter, exit, pass, face, wait).
 - Supported directions: left, right, forward, backward, straight, around.
-- Supported spatial relations: near, in_front_of, behind, left_of, right_of, inside, into, outside, through, along, toward, away_from, at, between, end_of, past.
+- Supported relations: near, in_front_of, behind, left_of, right_of, inside, into, outside, through, along, toward, away_from, at, between, end_of, past, before, just_before, before_hitting, after.
 - Do NOT parse 3D/vertical instructions (upstairs, downstairs, take the elevator, floor, climb, descend) as confident 2D actions. If they appear, set action=UNKNOWN and keep confidence low.
 - For ambiguous instructions (e.g., "go over there"), set low confidence.
 
@@ -56,6 +59,9 @@ Valid roles: path, where, progress, target, terminate, start. ONLY use these six
 - "turn left at the sofa" -> role="where", relation="at"
 - "until you see/reach the sofa" -> role="terminate", trigger="see"/"reach"
 - "when you see the sofa, turn left" -> role="start", trigger="see"
+- "just before you reach the painting, turn left" -> role="where", relation="just_before", landmark="painting"
+- "before hitting the glass wall, turn right" -> role="where", relation="before_hitting", landmark="glass wall"
+- "before the door, turn left" -> role="where", relation="before", landmark="door"
 - "instead of entering the kitchen" -> exclude that action
 - "do not enter the room" -> if safety-critical, add to constraints
 - Descriptive side-keeping (e.g., "keeping X on your left") should be mapped to role="path", relation="left_of" or omitted if it does not define a navigational action
@@ -227,6 +233,75 @@ Output format:
 Output ONLY the JSON object.
 """
 
+FIDELITY_AUDIT_SYSTEM_PROMPT = """You are a VLN instruction fidelity auditor.
+
+Your job is to audit whether each candidate navigation plan faithfully, completely, and correctly represents the original English instruction.
+
+Audit dimensions for each plan:
+1. missing_action — an action required by the instruction is missing.
+2. extra_action — an action not mentioned in the instruction is present.
+3. wrong_order — the execution order does not match temporal expressions (before/after/instead of/do not).
+4. wrong_direction — a direction (left/right/forward/etc.) is incorrect.
+5. wrong_landmark — a landmark or spatial reference is wrong or missing.
+6. missing_condition — a trigger condition (until/when/once) is lost.
+7. wrong_constraint — a forbidden action or safety rule is wrong or missing.
+8. negation_lost — an "instead of" or "do not" meaning is lost.
+9. unsupported_motion — vertical motion (upstairs/downstairs/elevator) is present.
+10. unresolved_reference — a pronoun or anaphor (that/it/this path) cannot be resolved.
+11. invalid_step_mapping — step semantics do not map to the instruction.
+
+Rules:
+- Assign plan_confidence between 0.0 and 1.0 for the whole plan.
+- Assign step_confidence between 0.0 and 1.0 for each step.
+- blocking_issues must ONLY use the exact strings listed above.
+- A plan with any blocking issue should still receive confidence scores.
+- Return ONLY a JSON object with an "audits" array.
+
+Output format:
+{
+  "audits": [
+    {
+      "candidate_id": "p1",
+      "plan_confidence": 0.93,
+      "blocking_issues": [],
+      "step_confidences": [
+        {"step_id": 1, "confidence": 0.97},
+        {"step_id": 2, "confidence": 0.89}
+      ]
+    }
+  ]
+}
+
+Output ONLY the JSON object.
+"""
+
+STEP_CANDIDATE_GENERATION_SYSTEM_PROMPT = """You are a VLN step candidate generator.
+
+Given an original instruction and a primary execution plan, generate alternative interpretations for specific target steps.
+
+Rules:
+- Only modify the requested target steps.
+- Do NOT modify any other steps or constraints.
+- Each candidate must be a plausible alternative reading of the original instruction for that step.
+- Do NOT return candidates identical to the primary step.
+- Return ONLY a JSON object with "step_candidates".
+
+Output format:
+{
+  "step_candidates": [
+    {
+      "step_id": 2,
+      "candidates": [
+        {"action": "TURN", "direction": "right", "features": []},
+        {"action": "TURN", "direction": "left", "features": [{"role": "where", "relation": "before", "landmark": "sofa"}]}
+      ]
+    }
+  ]
+}
+
+Output ONLY the JSON object.
+"""
+
 
 def _get_config() -> Dict[str, Any]:
     backend = os.getenv("VLN_LLM_BACKEND", DEFAULT_BACKEND).lower()
@@ -314,6 +389,40 @@ def _build_step_verifier_prompt(
         'Rate the confidence of each primary step and each alternative step.',
         'Return ONLY a JSON object: {"step_confidences": [{"step_id":1,"confidence":0.97},...], "candidate_confidences": [{"step_id":2,"rank":2,"confidence":0.84},...]}',
     ])
+    return '\n'.join(lines)
+
+
+def _build_audit_prompt(instruction: str, plans: List[Dict[str, Any]]) -> str:
+    lines = [
+        f'Instruction: "{instruction}"',
+        '',
+        'Candidate plans:',
+    ]
+    for p in plans:
+        cid = p.get("candidate_id", "unknown")
+        lines.append(f'  {cid}: {json.dumps(p, default=str)}')
+    lines.extend([
+        '',
+        'Audit each plan for fidelity to the instruction.',
+        'Return ONLY a JSON object: {"audits": [{"candidate_id":"p1","plan_confidence":0.93,"blocking_issues":[],"step_confidences":[{"step_id":1,"confidence":0.97}]}, ...]}',
+    ])
+    return '\n'.join(lines)
+
+
+def _build_step_candidates_prompt(
+    instruction: str,
+    primary_plan: Dict[str, Any],
+    target_step_ids: List[int],
+) -> str:
+    lines = [
+        f'Instruction: "{instruction}"',
+        '',
+        f'Primary plan: {json.dumps(primary_plan, default=str)}',
+        '',
+        f'Generate alternative interpretations for these target steps only: {target_step_ids}',
+        'Do NOT modify any other steps or constraints.',
+        'Return ONLY a JSON object: {"step_candidates": [{"step_id":2,"candidates":[{"action":"TURN","direction":"right","features":[]}]}, ...]}',
+    ]
     return '\n'.join(lines)
 
 
@@ -535,6 +644,493 @@ def verify_step_candidates(
         "step_confidences": out_steps,
         "candidate_confidences": out_cands,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FIDELITY AUDITOR
+# ═════════════════════════════════════════════════════════════════════════════
+
+AUDITOR_SYSTEM_PROMPT = """You are a VLN instruction fidelity auditor.
+
+Your sole job is to assess how faithfully a proposed 2D navigation plan represents the original instruction.
+
+For each plan, check against the original instruction:
+1. MISSING actions required by the instruction.
+2. EXTRA actions not mentioned in the instruction.
+3. WRONG execution order.
+4. WRONG direction, landmark, or spatial relation.
+5. MISSING or WRONG execution conditions (until, when, before, just before,
+   before hitting, after, dead-end). If any such condition in the instruction
+   is omitted or weakened in a plan, include missing_condition in
+   blocking_issues.
+6. LOST negation or exclusion semantics (instead of, do not, without).
+7. INCOMPLETE or WRONG constraints (forbidden actions).
+8. UNRESOLVED cross-sentence references (that painting, this path).
+9. Any active vertical motion (upstairs, downstairs, elevator) in a 2D plan.
+
+Scoring rules:
+- plan_confidence must be in [0.0, 1.0].
+- 1.0 means perfectly faithful, complete, and executable.
+- 0.0 means completely wrong or unrelated.
+- Deduct for each issue proportionally to severity.
+- step_confidences must also be in [0.0, 1.0].
+
+Allowed blocking_issues (exact strings):
+- missing_action
+- extra_action
+- wrong_order
+- wrong_direction
+- wrong_landmark
+- missing_condition
+- wrong_constraint
+- negation_lost
+- unsupported_motion
+- unresolved_reference
+- invalid_step_mapping
+
+Return ONLY a JSON object with this exact shape:
+{"audits": [{"candidate_id":"p1","plan_confidence":0.93,"blocking_issues":[],"step_confidences":[{"step_id":1,"confidence":0.97},...]}, ...]}
+"""
+
+STEP_CANDIDATE_GENERATOR_SYSTEM_PROMPT = """You are a VLN step candidate generator.
+
+Given an original instruction and a primary execution plan, generate alternative interpretations for specific low-confidence steps.
+
+Rules:
+- Only suggest alternatives for the TARGET steps explicitly listed.
+- Do NOT modify any non-target steps.
+- Do NOT modify constraints.
+- Each alternative must describe exactly one step (action, direction, features).
+- Do NOT return a candidate identical to the current primary step.
+- Consider the full instruction context when generating alternatives.
+- Generate at most 3 alternatives per target step.
+
+Return ONLY a JSON object with this exact shape:
+{"step_candidates": [{"step_id":2,"candidates":[{"action":"TURN","direction":"right","features":[]},...]}, ...]}
+"""
+
+SEMANTIC_SEGMENTER_SYSTEM_PROMPT = """You partition long 2D navigation instructions into short, coherent instruction segments.
+
+Rules:
+- Return contiguous excerpts from the original instruction only: do not rewrite, omit, duplicate, or reorder words.
+- Keep execution order unchanged.
+- Prefer boundaries between completed navigation phases.
+- Keep an antecedent together with references such as this path, that painting, those tiles, or those chairs whenever possible.
+- Keep a condition together with the action it governs, such as until/before/after/then clauses.
+- Every segment must remain within all requested sentence, navigation-phase, and word budgets.
+- Split within a long sentence at a natural clause or completed navigation-phase boundary when its budgets require it.
+
+Return ONLY a JSON object with this exact shape:
+{"segments": ["original contiguous excerpt 1", "original contiguous excerpt 2"]}
+"""
+
+
+_VALID_BLOCKING_ISSUES = {
+    "missing_action",
+    "extra_action",
+    "wrong_order",
+    "wrong_direction",
+    "wrong_landmark",
+    "missing_condition",
+    "wrong_constraint",
+    "negation_lost",
+    "unsupported_motion",
+    "unresolved_reference",
+    "invalid_step_mapping",
+}
+
+def _audit_failure(reason: str) -> None:
+    """Record why an audit invocation could not yield a usable audit."""
+    logger.warning("VLN audit unavailable: %s", reason)
+    return None
+
+
+def _build_auditor_prompt(
+    instruction: str,
+    plans: List[Dict[str, Any]],
+) -> str:
+    lines = [
+        f'Original instruction: "{instruction}"',
+        '',
+        'Proposed plans:',
+    ]
+    for p in plans:
+        cid = p.get("candidate_id", "unknown")
+        lines.append(f'  {cid}: {json.dumps(p, default=str)}')
+    lines.extend([
+        '',
+        'Audit each plan for fidelity to the instruction. Check every condition '
+        '(until, when, before, just before, before hitting, after, dead-end); '
+        'if a plan omits or weakens one, include "missing_condition" in blocking_issues.',
+        'Return ONLY JSON: {"audits": [{"candidate_id":"p1","plan_confidence":0.93,"blocking_issues":[],"step_confidences":[{"step_id":1,"confidence":0.97},...]}, ...]}',
+    ])
+    return '\n'.join(lines)
+
+
+def _build_step_candidate_generator_prompt(
+    instruction: str,
+    primary_plan: Dict[str, Any],
+    target_step_ids: List[int],
+) -> str:
+    lines = [
+        f'Original instruction: "{instruction}"',
+        '',
+        'Primary execution plan:',
+    ]
+    for t in primary_plan.get("tasks", []):
+        lines.append(f'  step {t["step_id"]}: {json.dumps(t, default=str)}')
+    if primary_plan.get("constraints"):
+        lines.extend(['', 'Constraints:'])
+        for c in primary_plan["constraints"]:
+            lines.append(f'  {json.dumps(c, default=str)}')
+    lines.extend([
+        '',
+        f'Target steps needing alternatives: {target_step_ids}',
+        '',
+        'Generate alternative interpretations for ONLY the target steps.',
+        'Return ONLY JSON: {"step_candidates": [{"step_id":2,"candidates":[{"action":"TURN","direction":"right","features":[]},...]}, ...]}',
+    ])
+    return '\n'.join(lines)
+
+
+def _build_semantic_segmenter_prompt(
+    instruction: str,
+    max_sentences: int,
+    max_phases: int,
+    max_words: int,
+) -> str:
+    return '\n'.join([
+        f'Original instruction: "{instruction}"',
+        '',
+        'Partition it into sequential contiguous excerpts with each segment containing at most:',
+        f'- {max_sentences} sentences',
+        f'- {max_phases} recognizable navigation action phases',
+        f'- {max_words} English words',
+        'Preserve the exact original wording and punctuation in the segments.',
+        'Keep references and their navigation context together where the size limit permits.',
+        'For a long single sentence, split only at coherent clause or navigation-phase boundaries.',
+        'Return ONLY JSON: {"segments": ["...", "..."]}',
+    ])
+
+
+def split_instruction_semantically(
+    instruction: str,
+    max_sentences: int = 5,
+    max_phases: int = 5,
+    max_words: int = 120,
+    **overrides: Any,
+) -> Optional[List[str]]:
+    """Ask the configured LLM to divide a long instruction into coherent excerpts."""
+    cfg = _get_config()
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+
+    prompt = _build_semantic_segmenter_prompt(
+        instruction,
+        max_sentences=max_sentences,
+        max_phases=max_phases,
+        max_words=max_words,
+    )
+    if cfg["backend"] == "local":
+        result = _call_local(
+            instruction,
+            cfg["model_path"],
+            temperature=0.0,
+            max_tokens=cfg["max_tokens"],
+            system_prompt=SEMANTIC_SEGMENTER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+        )
+    else:
+        url = f"{cfg['base_url']}/chat/completions"
+        payload = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": SEMANTIC_SEGMENTER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {cfg['api_key']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                body = resp.read().decode("utf-8")
+                response_json = json.loads(body)
+            result = json.loads(response_json["choices"][0]["message"]["content"])
+        except Exception:
+            return None
+
+    if not isinstance(result, dict):
+        return None
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        return None
+    if any(not isinstance(segment, str) or not segment.strip() for segment in segments):
+        return None
+    return [segment.strip() for segment in segments]
+
+
+def audit_plans_against_instruction(
+    instruction: str,
+    plans: List[Dict[str, Any]],
+    **overrides: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """Ask the LLM to audit how faithfully each plan represents the instruction.
+
+    Args:
+        instruction: Original instruction.
+        plans: List of plan dicts, each with "candidate_id", "tasks", "constraints".
+        **overrides: Backend overrides.
+
+    Returns:
+        List of audit dicts, each with:
+            - candidate_id
+            - plan_confidence (float)
+            - blocking_issues (list of str)
+            - step_confidences (list of {step_id, confidence})
+        or None if audit fails.
+    """
+    if not plans:
+        return _audit_failure("audit_schema_invalid:no_plans")
+
+    cfg = _get_config()
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+
+    prompt = _build_auditor_prompt(instruction, plans)
+    system_prompt = AUDITOR_SYSTEM_PROMPT
+
+    if cfg["backend"] == "local":
+        result = _call_local(
+            instruction,
+            cfg["model_path"],
+            temperature=0.0,
+            max_tokens=cfg["max_tokens"],
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+        )
+    else:
+        url = f"{cfg['base_url']}/chat/completions"
+        payload = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {cfg['api_key']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                body = resp.read().decode("utf-8")
+                response_json = json.loads(body)
+            content = response_json["choices"][0]["message"]["content"]
+        except Exception:
+            return _audit_failure("audit_backend_failed")
+        try:
+            result = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return _audit_failure("audit_invalid_json")
+
+    if result is None:
+        return _audit_failure("audit_backend_failed")
+
+    audits = result.get("audits")
+    if not isinstance(audits, list):
+        return _audit_failure("audit_schema_invalid:audits")
+
+    valid_ids = {p.get("candidate_id") for p in plans}
+    seen_ids: set = set()
+    out: List[Dict[str, Any]] = []
+
+    for item in audits:
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("candidate_id")
+        if cid not in valid_ids:
+            return _audit_failure("audit_step_mapping_invalid:candidate_id")
+        if cid in seen_ids:
+            return _audit_failure("audit_step_mapping_invalid:duplicate_candidate_id")
+
+        plan_conf = item.get("plan_confidence")
+        if not isinstance(plan_conf, (int, float)) or not (0.0 <= plan_conf <= 1.0):
+            return _audit_failure("audit_schema_invalid:plan_confidence")
+
+        blocking = item.get("blocking_issues", [])
+        if not isinstance(blocking, list):
+            return _audit_failure("audit_schema_invalid:blocking_issues")
+        for issue in blocking:
+            if issue not in _VALID_BLOCKING_ISSUES:
+                return _audit_failure("audit_schema_invalid:blocking_issue")
+
+        step_confs = item.get("step_confidences", [])
+        if not isinstance(step_confs, list):
+            return _audit_failure("audit_schema_invalid:step_confidences")
+
+        # Validate step_confidences: each step_id must be present exactly once
+        plan_step_ids = {t.get("step_id") for t in next(
+            (p.get("tasks", []) for p in plans if p.get("candidate_id") == cid), []
+        )}
+        seen_step_ids: set = set()
+        out_steps: List[Dict[str, Any]] = []
+        for sc in step_confs:
+            if not isinstance(sc, dict):
+                continue
+            sid = sc.get("step_id")
+            conf = sc.get("confidence")
+            if sid not in plan_step_ids:
+                return _audit_failure("audit_step_mapping_invalid:step_id")
+            if sid in seen_step_ids:
+                return _audit_failure("audit_step_mapping_invalid:duplicate_step_id")
+            if not isinstance(conf, (int, float)) or not (0.0 <= conf <= 1.0):
+                return _audit_failure("audit_schema_invalid:step_confidence")
+            seen_step_ids.add(sid)
+            out_steps.append({"step_id": sid, "confidence": float(conf)})
+
+        # step_confidences may be partial; missing steps don't fail the audit
+        seen_ids.add(cid)
+        out.append({
+            "candidate_id": cid,
+            "plan_confidence": float(plan_conf),
+            "blocking_issues": list(blocking),
+            "step_confidences": out_steps,
+        })
+
+    # Must return exactly all input candidate_ids
+    if seen_ids != valid_ids:
+        return _audit_failure("audit_step_mapping_invalid:missing_candidate_id")
+
+    return out
+
+
+def generate_step_candidates(
+    instruction: str,
+    primary_plan: Dict[str, Any],
+    target_step_ids: List[int],
+    max_variants_per_step: int = 3,
+    **overrides: Any,
+) -> Optional[Dict[int, List[Dict[str, Any]]]]:
+    """Ask the LLM to generate alternative interpretations for low-confidence steps.
+
+    Args:
+        instruction: Original instruction.
+        primary_plan: Dict with "tasks" and "constraints".
+        target_step_ids: List of step_id values needing alternatives.
+        max_variants_per_step: Max alternatives to request per step.
+        **overrides: Backend overrides.
+
+    Returns:
+        Dict mapping step_id -> list of candidate task dicts, or None on failure.
+    """
+    if not target_step_ids:
+        return {}
+
+    cfg = _get_config()
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+
+    prompt = _build_step_candidate_generator_prompt(instruction, primary_plan, target_step_ids)
+    system_prompt = STEP_CANDIDATE_GENERATOR_SYSTEM_PROMPT
+
+    if cfg["backend"] == "local":
+        result = _call_local(
+            instruction,
+            cfg["model_path"],
+            temperature=0.2,
+            max_tokens=cfg["max_tokens"],
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+        )
+    else:
+        url = f"{cfg['base_url']}/chat/completions"
+        payload = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {cfg['api_key']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                body = resp.read().decode("utf-8")
+                response_json = json.loads(body)
+            content = response_json["choices"][0]["message"]["content"]
+            result = json.loads(content)
+        except Exception:
+            return None
+
+    if result is None:
+        return None
+
+    step_candidates = result.get("step_candidates")
+    if not isinstance(step_candidates, list):
+        return None
+
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    primary_tasks = {t.get("step_id"): t for t in primary_plan.get("tasks", [])}
+
+    for group in step_candidates:
+        if not isinstance(group, dict):
+            continue
+        sid = group.get("step_id")
+        if sid not in target_step_ids:
+            continue
+        cands = group.get("candidates", [])
+        if not isinstance(cands, list):
+            continue
+        kept: List[Dict[str, Any]] = []
+        for cand in cands[:max_variants_per_step]:
+            if not isinstance(cand, dict):
+                continue
+            action = cand.get("action")
+            if action is None:
+                continue
+            # Skip candidates identical to primary step
+            primary_task = primary_tasks.get(sid)
+            if primary_task is not None:
+                if (primary_task.get("action") == action
+                        and primary_task.get("direction") == cand.get("direction")
+                        and primary_task.get("features") == cand.get("features")):
+                    continue
+            kept.append(cand)
+        if kept:
+            out[sid] = kept
+
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -865,17 +1461,19 @@ def parse_with_llm(
     raw_votes: List[Dict[str, Any]] = []
     for _ in range(vc):
         result = _call_backend(instruction, cfg)
-        if result is None:
-            return False, []
+        if not isinstance(result, dict):
+            logger.warning("VLN initial generation vote failed: backend_or_json_failure")
+            continue
         actions = result.get("actions", [])
-        if not isinstance(actions, list):
-            return False, []
+        if not isinstance(actions, list) or any(not isinstance(a, dict) for a in actions):
+            logger.warning("VLN initial generation vote failed: invalid_actions_schema")
+            continue
         for i, a in enumerate(actions):
             if "id" not in a:
                 a["id"] = f"a{i+1}"
         raw_votes.append(result)
 
-    return True, raw_votes
+    return bool(raw_votes), raw_votes
 
 
 def adjudicate_plan(

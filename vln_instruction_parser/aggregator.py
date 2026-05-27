@@ -237,6 +237,111 @@ def _task_eq(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     return a_sig == b_sig
 
 
+def collect_distinct_valid_plans(
+    raw_votes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Compile all raw votes into distinct valid executable plans with vote support.
+
+    Steps:
+    1. Compile each draft and filter invalid plans.
+    2. Group by full plan signature and count vote support.
+    3. Sort groups by vote_support descending (stable tie-break by signature).
+    4. Assign stable candidate_id (p1, p2, ...) to each distinct plan.
+    5. Return representative plans enriched with candidate_id and vote_support.
+
+    Returns:
+        List of plan dicts, each with added keys:
+        - "candidate_id": "p1", "p2", ...
+        - "vote_support": int
+    """
+    if not raw_votes:
+        return []
+
+    # Compile and filter
+    compiled: List[Dict[str, Any]] = []
+    for vote in raw_votes:
+        plan = compile_draft(vote)
+        if _is_valid_executable_plan(plan):
+            compiled.append(plan)
+
+    if not compiled:
+        return []
+
+    # Group by signature and count votes
+    groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for plan in compiled:
+        sig = _plan_signature(plan)
+        groups.setdefault(sig, []).append(plan)
+
+    # Sort by vote_support descending, then by signature for stability
+    sorted_groups = sorted(
+        groups.items(),
+        key=lambda item: (-len(item[1]), str(item[0])),
+    )
+
+    out: List[Dict[str, Any]] = []
+    for idx, (sig, group) in enumerate(sorted_groups, start=1):
+        rep = group[0]
+        plan: Dict[str, Any] = {
+            "candidate_id": f"p{idx}",
+            "vote_support": len(group),
+            "status": rep.get("status", "ok"),
+            "confidence": rep.get("confidence", 1.0),
+            "tasks": rep.get("tasks", []),
+            "constraints": _union_dicts([p.get("constraints", []) for p in group]),
+        }
+        if rep.get("reason") is not None:
+            plan["reason"] = rep["reason"]
+        out.append(plan)
+
+    return out
+
+
+def classify_plan_difference(
+    primary_plan: Dict[str, Any],
+    other_plan: Dict[str, Any],
+) -> str:
+    """
+    Classify how two plans differ structurally.
+
+    Returns one of:
+    - "identical": same signature.
+    - "different_task_count": different number of tasks.
+    - "different_constraints": constraints differ.
+    - "multiple_task_diffs": more than one task differs.
+    - "single_task_diff": exactly one task differs (localizable).
+    """
+    if _plan_signature(primary_plan) == _plan_signature(other_plan):
+        return "identical"
+
+    primary_tasks = primary_plan.get("tasks", [])
+    other_tasks = other_plan.get("tasks", [])
+
+    if len(other_tasks) != len(primary_tasks):
+        return "different_task_count"
+
+    primary_constraints = tuple(
+        sorted(json.dumps(c, sort_keys=True) for c in primary_plan.get("constraints", []))
+    )
+    other_constraints = tuple(
+        sorted(json.dumps(c, sort_keys=True) for c in other_plan.get("constraints", []))
+    )
+    if primary_constraints != other_constraints:
+        return "different_constraints"
+
+    diffs = [
+        i for i, (pt, ct) in enumerate(zip(primary_tasks, other_tasks))
+        if not _task_eq(pt, ct)
+    ]
+
+    if len(diffs) == 0:
+        return "identical"  # should not happen due to signature check
+    if len(diffs) == 1:
+        return "single_task_diff"
+    return "multiple_task_diffs"
+
+
 def get_conflict_candidates(
     raw_votes: List[Dict[str, Any]]
 ) -> List[List[Dict[str, Any]]]:

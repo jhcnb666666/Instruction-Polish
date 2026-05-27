@@ -58,6 +58,12 @@ VALID_RELATIONS = {
     "after",
 }
 
+RELATION_ALIASES = {
+    "before_reach": "before",
+    "before_reaching": "before",
+    "immediately_before": "just_before",
+}
+
 
 def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -81,7 +87,13 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     excluded = draft.get("excluded", [])
     constraints_raw = draft.get("constraints", [])
 
-    if not isinstance(actions, list):
+    if not isinstance(actions, list) or any(not isinstance(a, dict) for a in actions):
+        return _invalid_draft("invalid_draft")
+    if not isinstance(order, list) or any(not isinstance(item, dict) for item in order):
+        return _invalid_draft("invalid_draft")
+    if not isinstance(excluded, list):
+        return _invalid_draft("invalid_draft")
+    if not isinstance(constraints_raw, list) or any(not isinstance(item, dict) for item in constraints_raw):
         return _invalid_draft("invalid_draft")
 
     # Auto-assign ids if missing
@@ -106,24 +118,34 @@ def compile_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         if direction is not None and direction not in VALID_DIRECTIONS:
             return _invalid_draft(f"invalid_direction:{direction}")
 
-    # 2. Validate features — skip unknown roles/relations rather than failing entirely
+    # 2. Validate features. Trigger features already carry executable meaning
+    # through trigger + landmark, so an optional descriptive relation can be
+    # removed without dropping the stop/start condition.
     for a in actions:
         valid_features = []
-        for f in a.get("features", []):
+        raw_features = a.get("features", [])
+        if not isinstance(raw_features, list) or any(not isinstance(f, dict) for f in raw_features):
+            return _invalid_draft("invalid_feature")
+        for f in raw_features:
             role = f.get("role")
             if role not in VALID_FEATURE_ROLES:
                 continue
-            relation = f.get("relation")
-            if relation is not None and relation not in VALID_RELATIONS:
-                # Skip features with invalid relations
-                continue
+            normalized_feature = dict(f)
+            relation = normalized_feature.get("relation")
+            if relation in RELATION_ALIASES:
+                relation = RELATION_ALIASES[relation]
+                normalized_feature["relation"] = relation
             if role in ("terminate", "start"):
-                if not f.get("trigger") or not f.get("landmark"):
+                if not normalized_feature.get("trigger") or not normalized_feature.get("landmark"):
                     continue
+                if relation is not None and relation not in VALID_RELATIONS:
+                    normalized_feature.pop("relation", None)
             else:
-                if not f.get("relation") or not f.get("landmark"):
+                if relation is not None and relation not in VALID_RELATIONS:
+                    return _invalid_draft(f"invalid_feature_relation:{relation}")
+                if not normalized_feature.get("relation") or not normalized_feature.get("landmark"):
                     continue
-            valid_features.append(f)
+            valid_features.append(normalized_feature)
         a["features"] = valid_features
 
     # 3. Prune excluded actions BEFORE vertical detection

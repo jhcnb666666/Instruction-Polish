@@ -27,9 +27,23 @@ def _make_response(actions, order=None, constraints=None, excluded=None):
     }
 
 
+def _audit(cid, plan_conf, step_confs=None, blocking=None):
+    return {
+        "candidate_id": cid,
+        "plan_confidence": plan_conf,
+        "blocking_issues": list(blocking or []),
+        "step_confidences": [
+            {"step_id": sid, "confidence": c}
+            for sid, c in (step_confs or {}).items()
+        ],
+    }
+
+
 class TestTemporalReordering:
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_before_reorder(self, mock_call):
+    def test_before_reorder(self, mock_call, mock_audit, mock_gen):
         """Before turning left, go straight -> GO_STRAIGHT then TURN."""
         actions = [
             _action("a1", "MOVE_FORWARD", "straight", [{"role": "path", "relation": "along", "landmark": "hallway"}]),
@@ -39,6 +53,8 @@ class TestTemporalReordering:
             actions,
             order=[{"before": "a1", "after": "a2"}],
         )
+        mock_audit.return_value = [_audit("p1", 0.96, {1: 0.96, 2: 0.96})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Before turning left, go straight down the hallway.", vote_count=3)
         tasks_out = result["tasks"]
@@ -48,8 +64,10 @@ class TestTemporalReordering:
         assert tasks_out[0]["step_id"] == 1
         assert tasks_out[1]["step_id"] == 2
 
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_after_reorder(self, mock_call):
+    def test_after_reorder(self, mock_call, mock_audit, mock_gen):
         """Turn left after passing the sofa -> PASS then TURN."""
         actions = [
             _action("a1", "PASS", features=[{"role": "progress", "relation": "past", "landmark": "sofa"}]),
@@ -59,6 +77,8 @@ class TestTemporalReordering:
             actions,
             order=[{"before": "a1", "after": "a2"}],
         )
+        mock_audit.return_value = [_audit("p1", 0.96, {1: 0.96, 2: 0.96})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Turn left after passing the sofa.", vote_count=3)
         tasks_out = result["tasks"]
@@ -67,8 +87,10 @@ class TestTemporalReordering:
 
 
 class TestSuppression:
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_instead_of_suppresses_enter(self, mock_call):
+    def test_instead_of_suppresses_enter(self, mock_call, mock_audit, mock_gen):
         """Instead of entering the kitchen, turn right -> only TURN."""
         actions = [
             _action("a1", "TURN", "right", [{"role": "where", "relation": "at", "landmark": "door"}]),
@@ -77,6 +99,8 @@ class TestSuppression:
             actions,
             excluded=[{"id": "ex1", "reason": "replaced_by_instead"}],
         )
+        mock_audit.return_value = [_audit("p1", 0.95, {1: 0.95})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Instead of entering the kitchen, turn right at the door.", vote_count=3)
         tasks_out = result["tasks"]
@@ -85,8 +109,10 @@ class TestSuppression:
         actions_list = [t["action"] for t in tasks_out]
         assert "ENTER" not in actions_list
 
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_do_not_suppresses_enter(self, mock_call):
+    def test_do_not_suppresses_enter(self, mock_call, mock_audit, mock_gen):
         """Do not enter the room; wait outside -> only WAIT."""
         actions = [
             _action("a1", "WAIT", features=[{"role": "where", "relation": "outside", "landmark": "door"}]),
@@ -95,6 +121,8 @@ class TestSuppression:
             actions,
             constraints=[{"type": "forbidden_action", "action": "ENTER", "features": [{"role": "where", "relation": "inside", "landmark": "room"}]}],
         )
+        mock_audit.return_value = [_audit("p1", 0.95, {1: 0.95})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Do not enter the room; wait outside instead.", vote_count=3)
         tasks_out = result["tasks"]
@@ -106,14 +134,18 @@ class TestSuppression:
 
 
 class TestConjunction:
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_and_connects_two_actions(self, mock_call):
+    def test_and_connects_two_actions(self, mock_call, mock_audit, mock_gen):
         """Go straight and turn left by the sofa -> two tasks."""
         actions = [
             _action("a1", "MOVE_FORWARD", "straight", []),
             _action("a2", "TURN", "left", [{"role": "where", "relation": "at", "landmark": "sofa"}]),
         ]
         mock_call.return_value = _make_response(actions)
+        mock_audit.return_value = [_audit("p1", 0.95, {1: 0.95, 2: 0.95})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Go straight and turn left by the sofa.", vote_count=3)
         tasks_out = result["tasks"]
@@ -123,8 +155,10 @@ class TestConjunction:
 
 
 class TestMalformedAndLowConfidence:
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_malformed_reordered_low_confidence(self, mock_call):
+    def test_malformed_reordered_low_confidence(self, mock_call, mock_audit, mock_gen):
         """Before turn left go straight -> reordered with low confidence."""
         actions = [
             _action("a1", "MOVE_FORWARD", "straight", [], 0.65),
@@ -134,6 +168,8 @@ class TestMalformedAndLowConfidence:
             actions,
             order=[{"before": "a1", "after": "a2"}],
         )
+        mock_audit.return_value = [_audit("p1", 0.87, {1: 0.87, 2: 0.87})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Before turn left go straight.", vote_count=3)
         tasks_out = result["tasks"]
@@ -172,13 +208,17 @@ class TestRuleFallbackWithTemporalKeywords:
 
 
 class Test3DWithTemporal:
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm._call_backend")
-    def test_upstairs_then_turn_right(self, mock_call):
+    def test_upstairs_then_turn_right(self, mock_call, mock_audit, mock_gen):
         """Go upstairs, then turn right -> unsupported."""
         actions = [
             _action("a1", "UNKNOWN", features=[{"role": "target", "relation": "toward", "landmark": "upstairs"}]),
         ]
         mock_call.return_value = _make_response(actions)
+        mock_audit.return_value = [_audit("p1", 0.92, {1: 0.92})]
+        mock_gen.return_value = {}
 
         result = parse_instruction_llm("Go upstairs, then turn right.", vote_count=3)
         # Active vertical motion should be unsupported

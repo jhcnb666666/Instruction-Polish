@@ -5,6 +5,7 @@ import pytest
 from vln_instruction_parser.parser import (
     parse_instruction_llm,
     parse_instruction_auto,
+    _run_global_postprocess,
     apply_plan_confidence_policy,
 )
 from vln_instruction_parser.validator import validate_result
@@ -32,35 +33,44 @@ def _plan(confidence, tasks=None, constraints=None):
     }
 
 
-class TestVerifierIntegration:
-    """Verifier reranker drives confidence policy decisions."""
+def _audit(cid, plan_conf, step_confs=None, blocking=None):
+    return {
+        "candidate_id": cid,
+        "plan_confidence": plan_conf,
+        "blocking_issues": list(blocking or []),
+        "step_confidences": [
+            {"step_id": sid, "confidence": c}
+            for sid, c in (step_confs or {}).items()
+        ],
+    }
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+
+class TestFidelityAuditIntegration:
+    """Fidelity audit drives confidence and status decisions."""
+
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_096_ok_no_backtracking(self, mock_parse, mock_verify, mock_step_verify):
+    def test_high_fidelity_ok_no_backtracking(self, mock_parse, mock_audit, mock_gen):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
         ] * 3)
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.96},
+        mock_audit.return_value = [
+            _audit("p1", 0.96, {1: 0.97}),
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [{"step_id": 1, "confidence": 0.97}],
-            "candidate_confidences": [],
-        }
+        mock_gen.return_value = {}
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "ok"
-        assert result["confidence"] == 1.0
+        assert result["confidence"] == 0.96  # real score preserved, not forced to 1.0
         assert result["alternatives"] == []
-        assert result.get("backtracking", {}) == {"step_candidates": []}
+        assert result.get("backtracking") == {"step_candidates": []}
         validate_result(result)
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_095_c2_081_needs_review(self, mock_parse, mock_verify, mock_step_verify):
+    def test_ok_with_backtracking(self, mock_parse, mock_audit, mock_gen):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -70,52 +80,123 @@ class TestVerifierIntegration:
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
         ])
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.95},
-            {"candidate_id": "p2", "confidence": 0.81},
+        mock_audit.side_effect = lambda _inst, plans, **kw: [
+            _audit("p1", 0.93, {1: 0.93}),
+            _audit("p2", 0.85, {1: 0.85}),
+        ] if len(plans) == 2 else [
+            _audit(p["candidate_id"], 0.93, {1: 0.86})
+            for p in plans
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [{"step_id": 1, "confidence": 0.95}],
-            "candidate_confidences": [{"step_id": 1, "rank": 2, "confidence": 0.81}],
+        mock_gen.return_value = {
+            1: [{"action": "TURN", "direction": "right", "features": []}],
         }
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
-        # Close competitor at plan level => needs_review
-        assert result["status"] == "needs_review"
-        assert result["alternatives"] == []
-        # Backtracking may contain the local candidate if step verifier passed
-        validate_result(result)
-
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
-    @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_095_c2_080_ok(self, mock_parse, mock_verify, mock_step_verify):
-        mock_parse.return_value = (True, [
-            {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
-             "order": [], "constraints": [], "excluded": []},
-            {"actions": [{"id": "a1", "action": "TURN", "direction": "right", "features": []}],
-             "order": [], "constraints": [], "excluded": []},
-        ] + [
-            {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
-             "order": [], "constraints": [], "excluded": []},
-        ])
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.95},
-            {"candidate_id": "p2", "confidence": 0.80},
-        ]
-        mock_step_verify.return_value = {
-            "step_confidences": [{"step_id": 1, "confidence": 0.95}],
-            "candidate_confidences": [],
-        }
-        result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
-        # 0.95 - 0.80 = 0.15, NOT strictly < 0.15, so ok
         assert result["status"] == "ok"
         assert result["alternatives"] == []
         validate_result(result)
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    def test_step_margin_accepts_new_medium_boundary_when_plan_gate_passes(
+        self, mock_audit, mock_gen
+    ):
+        plan = {
+            "candidate_id": "p1",
+            "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
+            "constraints": [],
+        }
+        mock_audit.side_effect = [
+            [_audit("p1", 0.93, {1: 0.95})],
+            [_audit("rep_1_0", 0.84, {1: 0.55})],
+        ]
+        mock_gen.return_value = {
+            1: [{"action": "TURN", "direction": "right", "features": []}],
+        }
+
+        result = _run_global_postprocess("Turn left.", [plan])
+
+        candidates = result["backtracking"]["step_candidates"][0]["candidates"]
+        assert result["status"] == "ok"
+        assert candidates[0]["direction"] == "right"
+        assert candidates[0]["confidence"] == 0.55
+
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    def test_relaxed_step_margin_does_not_relax_plan_gate(self, mock_audit, mock_gen):
+        plan = {
+            "candidate_id": "p1",
+            "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
+            "constraints": [],
+        }
+        mock_audit.side_effect = [
+            [_audit("p1", 0.93, {1: 0.95})],
+            [_audit("rep_1_0", 0.78, {1: 0.55})],
+        ]
+        mock_gen.return_value = {
+            1: [{"action": "TURN", "direction": "right", "features": []}],
+        }
+
+        result = _run_global_postprocess("Turn left.", [plan])
+
+        assert result["status"] == "ok"
+        assert result["backtracking"] == {"step_candidates": []}
+
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    def test_relaxed_step_margin_still_rejects_blocked_candidate(self, mock_audit, mock_gen):
+        plan = {
+            "candidate_id": "p1",
+            "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
+            "constraints": [],
+        }
+        mock_audit.side_effect = [
+            [_audit("p1", 0.93, {1: 0.95})],
+            [_audit("rep_1_0", 0.84, {1: 0.55}, blocking=["wrong_direction"])],
+        ]
+        mock_gen.return_value = {
+            1: [{"action": "TURN", "direction": "right", "features": []}],
+        }
+
+        result = _run_global_postprocess("Turn left.", [plan])
+
+        assert result["status"] == "ok"
+        assert result["backtracking"] == {"step_candidates": []}
+
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    def test_backtracking_ranks_only_best_two_candidate_steps(self, mock_audit, mock_gen):
+        plan = {
+            "candidate_id": "p1",
+            "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
+            "constraints": [],
+        }
+        mock_audit.side_effect = [
+            [_audit("p1", 0.93, {1: 0.90})],
+            [
+                _audit("rep_1_0", 0.84, {1: 0.45}),
+                _audit("rep_1_1", 0.84, {1: 0.65}),
+                _audit("rep_1_2", 0.84, {1: 0.55}),
+            ],
+        ]
+        mock_gen.return_value = {
+            1: [
+                {"action": "TURN", "direction": "right", "features": []},
+                {"action": "TURN", "direction": "around", "features": []},
+                {"action": "STOP", "features": []},
+            ],
+        }
+
+        result = _run_global_postprocess("Turn left.", [plan])
+
+        candidates = result["backtracking"]["step_candidates"][0]["candidates"]
+        assert result["status"] == "ok"
+        assert [candidate["rank"] for candidate in candidates] == [2, 3]
+        assert [candidate["confidence"] for candidate in candidates] == [0.65, 0.55]
+
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_090_c2_071_needs_review(self, mock_parse, mock_verify, mock_step_verify):
+    def test_low_plan_confidence_needs_review(self, mock_parse, mock_audit, mock_gen):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "MOVE_FORWARD", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -124,81 +205,114 @@ class TestVerifierIntegration:
             {"actions": [{"id": "a1", "action": "STOP", "features": []}],
              "order": [], "constraints": [], "excluded": []},
         ])
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.90},
-            {"candidate_id": "p2", "confidence": 0.71},
-            {"candidate_id": "p3", "confidence": 0.69},
+        mock_audit.return_value = [
+            _audit("p1", 0.87, {1: 0.88, 2: 0.85, 3: 0.87}),
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [
-                {"step_id": 1, "confidence": 0.92},
-                {"step_id": 2, "confidence": 0.88},
-                {"step_id": 3, "confidence": 0.90},
-            ],
-            "candidate_confidences": [
-                {"step_id": 1, "rank": 2, "confidence": 0.71},
-            ],
-        }
+        mock_gen.return_value = {}
         result = parse_instruction_llm("Go straight then turn left and stop.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "needs_review"
         assert result["alternatives"] == []
         validate_result(result)
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_c1_089_c2_075_c3_070_needs_review(self, mock_parse, mock_verify, mock_step_verify):
+    def test_blocking_issue_needs_review(self, mock_parse, mock_audit, mock_gen):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "MOVE_FORWARD", "features": []}],
              "order": [], "constraints": [], "excluded": []},
-            {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
-             "order": [], "constraints": [], "excluded": []},
-            {"actions": [{"id": "a1", "action": "STOP", "features": []}],
-             "order": [], "constraints": [], "excluded": []},
-        ])
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.89},
-            {"candidate_id": "p2", "confidence": 0.75},
-            {"candidate_id": "p3", "confidence": 0.70},
+        ] * 2)
+        mock_audit.return_value = [
+            _audit("p1", 0.92, {1: 0.92}, blocking=["missing_condition"]),
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [
-                {"step_id": 1, "confidence": 0.90},
-                {"step_id": 2, "confidence": 0.88},
-                {"step_id": 3, "confidence": 0.89},
-            ],
-            "candidate_confidences": [
-                {"step_id": 1, "rank": 2, "confidence": 0.75},
-                {"step_id": 1, "rank": 3, "confidence": 0.70},
-            ],
-        }
-        result = parse_instruction_llm("Go straight then turn left and stop.", fallback_to_rules=False, vote_count=3)
+        mock_gen.return_value = {}
+        result = parse_instruction_llm("Go straight.", fallback_to_rules=False, vote_count=2)
         assert result["status"] == "needs_review"
         assert result["alternatives"] == []
         validate_result(result)
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_verifier_failure_degradation(self, mock_parse, mock_verify, mock_step_verify):
+    def test_audit_unavailable_degradation(self, mock_parse, mock_audit, mock_gen):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
-            {"actions": [{"id": "a1", "action": "TURN", "direction": "right", "features": []}],
-             "order": [], "constraints": [], "excluded": []},
-        ])
-        mock_verify.return_value = None
+        ] * 2)
+        mock_audit.return_value = None
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=2)
         assert result["status"] == "needs_review"
         assert result["confidence"] == 0.0
-        assert result.get("reason") == "confidence_verification_unavailable"
+        assert result.get("reason") == "instruction_fidelity_audit_unavailable"
+        assert len(result["tasks"]) == 1
+        assert mock_audit.call_count == 2
         assert result["alternatives"] == []
         validate_result(result)
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_backtracking_preserve_terminate_and_constraints(self, mock_parse, mock_verify, mock_step_verify):
+    def test_audit_retry_success_on_short_path(self, mock_parse, mock_audit, mock_gen):
+        mock_parse.return_value = (True, [
+            {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
+             "order": [], "constraints": [], "excluded": []},
+        ])
+        mock_audit.side_effect = [
+            None,
+            [_audit("p1", 0.97, {1: 0.97})],
+        ]
+        mock_gen.return_value = {}
+
+        result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=1)
+
+        assert result["status"] == "ok"
+        assert result["confidence"] == 0.97
+        assert mock_audit.call_count == 2
+
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    @patch("vln_instruction_parser.llm.parse_with_llm")
+    def test_invalid_compiled_draft_reports_no_valid_candidate(self, mock_parse, mock_audit):
+        mock_parse.return_value = (True, [{
+            "actions": [{
+                "id": "a1",
+                "action": "TURN",
+                "direction": "left",
+                "features": [{"role": "where", "relation": "unknown_temporal", "landmark": "painting"}],
+            }],
+            "order": [],
+            "constraints": [],
+            "excluded": [],
+        }])
+
+        result = parse_instruction_llm(
+            "Turn left before the painting.", fallback_to_rules=False, vote_count=1
+        )
+
+        assert result["status"] == "needs_review"
+        assert result["tasks"] == []
+        assert result["reason"] == "no_valid_candidate_plan"
+        mock_audit.assert_not_called()
+
+    @patch("vln_instruction_parser.parser.validate_result", side_effect=ValueError("invalid"))
+    @patch("vln_instruction_parser.llm.generate_step_candidates", return_value={})
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    def test_final_validation_failure_is_identifiable(self, mock_audit, _mock_gen, _mock_validate):
+        plan = {
+            "candidate_id": "p1",
+            "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
+            "constraints": [],
+        }
+        mock_audit.return_value = [_audit("p1", 0.97, {1: 0.97})]
+
+        result = _run_global_postprocess("Turn left.", [plan])
+
+        assert result["status"] == "needs_review"
+        assert result["reason"] == "result_validation_failed"
+
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
+    @patch("vln_instruction_parser.llm.parse_with_llm")
+    def test_backtracking_preserve_terminate_and_constraints(self, mock_parse, mock_audit, mock_gen):
         """Main plan must preserve full tasks and constraints."""
         mock_parse.return_value = (True, [
             {"actions": [
@@ -214,28 +328,26 @@ class TestVerifierIntegration:
                 ]},
             ], "order": [], "constraints": [], "excluded": []},
         ])
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.92},
-            {"candidate_id": "p2", "confidence": 0.83},
+        mock_audit.side_effect = lambda _inst, plans, **kw: [
+            _audit("p1", 0.92, {1: 0.92}),
+            _audit("p2", 0.83, {1: 0.83}),
+        ] if len(plans) == 2 else [
+            _audit(p["candidate_id"], 0.92, {1: 0.92})
+            for p in plans
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [{"step_id": 1, "confidence": 0.92}],
-            "candidate_confidences": [{"step_id": 1, "rank": 2, "confidence": 0.83}],
-        }
+        mock_gen.return_value = {}
         result = parse_instruction_llm("Go to the door.", fallback_to_rules=False, vote_count=2)
         assert result["status"] == "needs_review"
-        # Main plan has terminate feature and constraint
         assert any(f.get("role") == "terminate" for f in result["tasks"][0].get("features", []))
         assert len(result["constraints"]) == 1
-        # No full-plan alternatives anymore
         assert result["alternatives"] == []
         validate_result(result)
 
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_three_different_votes_kept(self, mock_parse, mock_verify, mock_step_verify):
-        """All three votes different -> all three candidates enter verifier."""
+    def test_three_different_votes_all_audited(self, mock_parse, mock_audit, mock_gen):
+        """All distinct plans enter fidelity audit."""
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "MOVE_FORWARD", "features": []}],
              "order": [], "constraints": [], "excluded": []},
@@ -244,18 +356,12 @@ class TestVerifierIntegration:
             {"actions": [{"id": "a1", "action": "STOP", "features": []}],
              "order": [], "constraints": [], "excluded": []},
         ])
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.88},
-            {"candidate_id": "p2", "confidence": 0.75},
-            {"candidate_id": "p3", "confidence": 0.70},
+        mock_audit.return_value = [
+            _audit("p1", 0.88, {1: 0.88}),
+            _audit("p2", 0.75, {1: 0.75}),
+            _audit("p3", 0.70, {1: 0.70}),
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [{"step_id": 1, "confidence": 0.88}],
-            "candidate_confidences": [
-                {"step_id": 1, "rank": 2, "confidence": 0.75},
-                {"step_id": 1, "rank": 3, "confidence": 0.70},
-            ],
-        }
+        mock_gen.return_value = {}
         result = parse_instruction_llm("Do something.", fallback_to_rules=False, vote_count=3)
         assert result["status"] == "needs_review"
         assert result["alternatives"] == []
@@ -369,21 +475,19 @@ class TestSchemaRoundtrip:
 
 
 class TestNoInternalMetadataInOutput:
-    @patch("vln_instruction_parser.llm.verify_step_candidates")
-    @patch("vln_instruction_parser.llm.verify_candidate_plans")
+    @patch("vln_instruction_parser.llm.generate_step_candidates")
+    @patch("vln_instruction_parser.llm.audit_plans_against_instruction")
     @patch("vln_instruction_parser.llm.parse_with_llm")
-    def test_output_has_no_raw_text_or_candidate_id(self, mock_parse, mock_verify, mock_step_verify):
+    def test_output_has_no_raw_text_or_candidate_id(self, mock_parse, mock_audit, mock_gen):
         mock_parse.return_value = (True, [
             {"actions": [{"id": "a1", "action": "TURN", "direction": "left", "features": []}],
              "order": [], "constraints": [], "excluded": []},
         ] * 3)
-        mock_verify.return_value = [
-            {"candidate_id": "p1", "confidence": 0.96},
+        mock_audit.return_value = [
+            {"candidate_id": "p1", "plan_confidence": 0.96, "blocking_issues": [],
+             "step_confidences": [{"step_id": 1, "confidence": 0.97}]},
         ]
-        mock_step_verify.return_value = {
-            "step_confidences": [{"step_id": 1, "confidence": 0.97}],
-            "candidate_confidences": [],
-        }
+        mock_gen.return_value = {}
         result = parse_instruction_llm("Turn left.", fallback_to_rules=False, vote_count=3)
         # Forbidden keys must not appear
         forbidden = {"raw_text", "original_instruction", "canonical_instruction",
@@ -401,10 +505,7 @@ class TestNoInternalMetadataInOutput:
 
 class TestRulePathConfidence:
     def test_rule_path_not_auto_accepted(self):
-        result = parse_instruction_auto("Turn left.")
-        # Even simple rule path no longer gets unconditional 1.0
-        # But since auto now routes through LLM, this actually calls LLM.
-        # We test parse_instruction directly instead.
+        # Test the rule interface directly; auto intentionally invokes the LLM.
         from vln_instruction_parser.parser import parse_instruction
         result = parse_instruction("Turn left.")
         assert result["status"] == "ok"

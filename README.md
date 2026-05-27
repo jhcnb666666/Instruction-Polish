@@ -145,14 +145,14 @@ A semantic 2D Vision-Language Navigation instruction parser is also included in 
 ```python
 from vln_instruction_parser import parse_instruction_auto
 
-# Recommended: automatically chooses rule or LLM parser
+# Recommended: LLM-first semantic parsing with long-chain handling
 result = parse_instruction_auto(
     "Follow the hallway until you see the sofa, then turn left at the door."
 )
 ```
 
 Three parsers are available:
-- `parse_instruction_auto(text)` — **Recommended**. Routes simple instructions to the rule engine and complex instructions to the LLM.
+- `parse_instruction_auto(text)` — **Recommended**. Runs the full semantic pipeline and segments over-budget instruction chains before a complete-instruction audit.
 - `parse_instruction(text)` — Rule-based parser for simple, unambiguous instructions.
 - `parse_instruction_llm(text)` — LLM-based parser with voting and semantic understanding.
 
@@ -231,9 +231,15 @@ Three parsers are available:
 
 | Input type | `parse_instruction_auto` | `parse_instruction` | `parse_instruction_llm` |
 |---|---|---|---|
-| Simple (1-2 actions, no temporal words) | Rule engine | Rule engine | Rule fallback only on LLM failure |
-| Complex (before/after/until/instead of/do not, 3+ actions, stairs/elevator) | LLM with voting + step-level backtracking | `status=needs_review`, empty tasks | LLM with step-level backtracking; rule fallback only on backend failure |
+| Simple (1-2 actions, no temporal words) | Full LLM fidelity pipeline | Rule engine | Rule fallback only on LLM failure |
+| Complex (before/after/until/instead of/do not, 3+ actions) | Full LLM fidelity pipeline; semantic segmentation when over budget | `status=needs_review`, empty tasks | LLM with step-level backtracking; rule fallback only on backend failure |
 | Active vertical (upstairs, downstairs, take elevator) | `status=unsupported` | `status=unsupported` | `status=unsupported` |
+
+### Long Instruction Segmentation
+
+`parse_instruction_auto()` keeps an instruction whole while it contains at most 5 sentences, 5 recognizable navigation phases, and 120 English words. If any budget is exceeded, an LLM first chooses ordered, contiguous semantic excerpts. Each excerpt goes through the same audit and backtracking pipeline as a short instruction; the merged plan is then audited against the complete original instruction. A blocking fidelity issue in that merged audit triggers one complete-instruction reparse.
+
+The budgets may be tightened with `VLN_SENTENCE_SPLIT_THRESHOLD`, `VLN_SEGMENT_MAX_PHASES`, and `VLN_SEGMENT_MAX_WORDS`. The legacy `VLN_MAX_SENTENCE_CHUNKS` setting remains an alias for the sentence budget. Values above the hard limits of 5 sentences, 5 phases, and 120 words are clamped.
 
 ### Step-Level Backtracking
 
@@ -241,6 +247,8 @@ When the LLM parser produces multiple competing interpretations, it now emits **
 
 - **`backtracking.step_candidates`** — a list of groups, one per ambiguous step.
 - Each group contains `rank: 2|3` candidates that differ from the primary task at that `step_id`.
+- A primary step above `0.95` keeps no alternatives; steps in `(0.90, 0.95]` keep candidates within a `0.40` step-confidence difference, and steps at or below `0.90` keep candidates within `0.50`.
+- Candidate steps must still pass the stricter full replacement-plan fidelity filter before they are emitted.
 - The `alternatives` field is deprecated for new output and will be empty when `status="ok"`.
 
 This design lets downstream planners explore local revisions (e.g., "turn left" vs "turn right" at step 2) without re-parsing the entire instruction.

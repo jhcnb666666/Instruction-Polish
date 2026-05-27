@@ -130,6 +130,80 @@ class TestCompileDraftFeatures:
         assert result["status"] == "ok"
         assert result["tasks"][0]["features"] == []
 
+    def test_terminate_unknown_relation_keeps_executable_trigger(self):
+        draft = {
+            "actions": [
+                {"id": "a1", "action": "MOVE_FORWARD", "features": [
+                    {
+                        "role": "terminate",
+                        "trigger": "notice",
+                        "relation": "change_in",
+                        "landmark": "floor tiles color from white to grey",
+                    }
+                ], "confidence": 0.9}
+            ],
+            "order": [],
+            "constraints": [],
+            "excluded": [],
+        }
+        result = compile_draft(draft)
+        assert result["status"] == "ok"
+        assert result["tasks"][0]["features"] == [{
+            "role": "terminate",
+            "landmark": "floor tiles color from white to grey",
+            "trigger": "notice",
+        }]
+
+    def test_before_reaching_alias_is_preserved(self):
+        draft = {
+            "actions": [
+                {"id": "a1", "action": "TURN", "direction": "left", "features": [
+                    {"role": "where", "relation": "before_reaching", "landmark": "painting"}
+                ], "confidence": 0.9}
+            ],
+            "order": [],
+            "constraints": [],
+            "excluded": [],
+        }
+        result = compile_draft(draft)
+        assert result["status"] == "ok"
+        assert result["tasks"][0]["features"] == [
+            {"role": "where", "relation": "before", "landmark": "painting"}
+        ]
+
+    def test_immediately_before_alias_is_just_before(self):
+        draft = {
+            "actions": [
+                {"id": "a1", "action": "TURN", "direction": "left", "features": [
+                    {"role": "where", "relation": "immediately_before", "landmark": "grey tiles"}
+                ], "confidence": 0.9}
+            ],
+            "order": [],
+            "constraints": [],
+            "excluded": [],
+        }
+        result = compile_draft(draft)
+        assert result["status"] == "ok"
+        assert result["tasks"][0]["features"] == [
+            {"role": "where", "relation": "just_before", "landmark": "grey tiles"}
+        ]
+
+    def test_unknown_relation_invalidates_candidate(self):
+        draft = {
+            "actions": [
+                {"id": "a1", "action": "TURN", "direction": "right", "features": [
+                    {"role": "where", "relation": "around_the_corner_from", "landmark": "glass wall"}
+                ], "confidence": 0.9}
+            ],
+            "order": [],
+            "constraints": [],
+            "excluded": [],
+        }
+        result = compile_draft(draft)
+        assert result["status"] == "needs_review"
+        assert result["tasks"] == []
+        assert result["reason"] == "invalid_feature_relation:around_the_corner_from"
+
 
 class TestCompileDraftVertical:
     def test_go_upstairs_unsupported(self):

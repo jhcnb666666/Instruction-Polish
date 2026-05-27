@@ -78,31 +78,41 @@ class TestValidateResult:
         }
         validate_result(result)
 
-    def test_valid_with_alternatives(self):
+    def test_valid_temporal_where_feature(self):
+        result = {
+            "status": "ok",
+            "confidence": 1.0,
+            "tasks": [
+                make_valid_task(
+                    action="TURN",
+                    direction="left",
+                    features=[make_feature(role="where", relation="just_before", landmark="painting")],
+                )
+            ],
+            "constraints": [],
+            "alternatives": [],
+        }
+        validate_result(result)
+
+    def test_needs_review_with_empty_alternatives_ok(self):
         result = {
             "status": "needs_review",
             "confidence": 0.93,
             "tasks": [make_valid_task()],
             "constraints": [],
-            "alternatives": [
-                make_alt(
-                    rank=2,
-                    confidence=0.84,
-                    tasks=[make_valid_task(action="TURN", direction="left")],
-                )
-            ],
+            "alternatives": [],
         }
         validate_result(result)
 
-    def test_ok_with_alternatives_raises(self):
+    def test_alternatives_must_always_be_empty(self):
         result = {
-            "status": "ok",
+            "status": "needs_review",
             "confidence": 1.0,
             "tasks": [make_valid_task()],
             "constraints": [],
             "alternatives": [make_alt()],
         }
-        with pytest.raises(ValueError, match="status=ok must not have alternatives"):
+        with pytest.raises(ValueError, match="alternatives must be empty"):
             validate_result(result)
 
     def test_bad_step_id(self):
