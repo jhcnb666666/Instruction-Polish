@@ -237,9 +237,9 @@ Three parsers are available:
 
 ### Long Instruction Segmentation
 
-`parse_instruction_auto()` keeps an instruction whole while it contains at most 5 sentences, 5 recognizable navigation phases, and 120 English words. If any budget is exceeded, an LLM first chooses ordered, contiguous semantic excerpts. Each excerpt goes through the same audit and backtracking pipeline as a short instruction; the merged plan is then audited against the complete original instruction. A blocking fidelity issue in that merged audit triggers one complete-instruction reparse.
+`parse_instruction_auto()` keeps an instruction whole while it contains at most 5 sentences, 5 recognizable navigation phases, and 120 English words. If any budget is exceeded, an LLM first chooses ordered, contiguous semantic excerpts. Before parsing those excerpts, a deterministic coalescing pass combines undersized neighboring excerpts when the merged segment remains within all hard budgets, reducing isolated fragments while preserving the original wording and order. Each optimized excerpt goes through the same audit and backtracking pipeline as a short instruction; the merged plan is then audited against the complete original instruction. A blocking fidelity issue in that merged audit triggers one complete-instruction reparse.
 
-The budgets may be tightened with `VLN_SENTENCE_SPLIT_THRESHOLD`, `VLN_SEGMENT_MAX_PHASES`, and `VLN_SEGMENT_MAX_WORDS`. The legacy `VLN_MAX_SENTENCE_CHUNKS` setting remains an alias for the sentence budget. Values above the hard limits of 5 sentences, 5 phases, and 120 words are clamped.
+The budgets may be tightened with `VLN_SENTENCE_SPLIT_THRESHOLD`, `VLN_SEGMENT_MAX_PHASES`, and `VLN_SEGMENT_MAX_WORDS`. `VLN_SEGMENT_TARGET_MIN_WORDS` sets a soft minimum target for optimized excerpts (default `60`); a shorter excerpt is retained when it cannot be combined without exceeding a hard budget. The legacy `VLN_MAX_SENTENCE_CHUNKS` setting remains an alias for the sentence budget. Values above the hard limits of 5 sentences, 5 phases, and 120 words are clamped.
 
 ### Step-Level Backtracking
 

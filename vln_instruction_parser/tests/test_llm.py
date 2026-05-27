@@ -164,11 +164,15 @@ class TestSemanticSegmentation:
                 max_sentences=2,
                 max_phases=3,
                 max_words=80,
+                target_min_words=45,
             )
         assert result == ["Walk forward. Turn left.", "Stop."]
         assert mock_call.call_args.kwargs["temperature"] == 0.0
         assert "3 recognizable navigation action phases" in mock_call.call_args.kwargs["user_prompt"]
         assert "80 English words" in mock_call.call_args.kwargs["user_prompt"]
+        assert "at least 45 English words per segment" in mock_call.call_args.kwargs["user_prompt"]
+        assert "do not split one sentence per segment by default" in mock_call.call_args.kwargs["user_prompt"]
+        assert "immediately following turn or stop" in mock_call.call_args.kwargs["user_prompt"]
 
     @patch("vln_instruction_parser.llm._call_local", return_value={"segments": ["", "Stop."]})
     def test_segmenter_rejects_empty_segment(self, _mock_call):

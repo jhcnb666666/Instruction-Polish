@@ -13,11 +13,13 @@ from vln_instruction_parser.parser import (
     _merge_initial_contributions,
     _merge_segment_results_into_plans,
     _valid_semantic_segments,
+    _coalesce_semantic_segments,
     _generate_initial_contribution_for_sentence,
     _run_global_postprocess,
     _sentence_split_threshold,
     _segment_max_phases,
     _segment_max_words,
+    _segment_target_min_words,
 )
 
 
@@ -245,6 +247,7 @@ class TestSentenceSplitThreshold:
             "VLN_MAX_SENTENCE_CHUNKS",
             "VLN_SEGMENT_MAX_PHASES",
             "VLN_SEGMENT_MAX_WORDS",
+            "VLN_SEGMENT_TARGET_MIN_WORDS",
         ):
             os.environ.pop(key, None)
 
@@ -254,6 +257,7 @@ class TestSentenceSplitThreshold:
             "VLN_MAX_SENTENCE_CHUNKS",
             "VLN_SEGMENT_MAX_PHASES",
             "VLN_SEGMENT_MAX_WORDS",
+            "VLN_SEGMENT_TARGET_MIN_WORDS",
         ):
             os.environ.pop(key, None)
 
@@ -276,6 +280,7 @@ class TestSentenceSplitThreshold:
     def test_phase_and_word_defaults(self):
         assert _segment_max_phases() == 5
         assert _segment_max_words() == 120
+        assert _segment_target_min_words(_segment_max_words()) == 60
 
     def test_stricter_phase_and_word_limits_take_effect(self):
         os.environ["VLN_SEGMENT_MAX_PHASES"] = "3"
@@ -288,6 +293,23 @@ class TestSentenceSplitThreshold:
         os.environ["VLN_SEGMENT_MAX_WORDS"] = "500"
         assert _segment_max_phases() == 5
         assert _segment_max_words() == 120
+
+    def test_target_min_words_configuration_and_clamping(self):
+        os.environ["VLN_SEGMENT_TARGET_MIN_WORDS"] = "35"
+        assert _segment_target_min_words(120) == 35
+
+        os.environ["VLN_SEGMENT_TARGET_MIN_WORDS"] = "invalid"
+        assert _segment_target_min_words(120) == 60
+
+        os.environ["VLN_SEGMENT_TARGET_MIN_WORDS"] = "0"
+        assert _segment_target_min_words(120) == 1
+
+        os.environ["VLN_SEGMENT_TARGET_MIN_WORDS"] = "500"
+        assert _segment_target_min_words(80) == 80
+
+    def test_default_target_is_clamped_by_stricter_word_budget(self):
+        os.environ["VLN_SEGMENT_MAX_WORDS"] = "40"
+        assert _segment_target_min_words(_segment_max_words()) == 40
 
 
 class TestParseInstructionAutoLongPath:
@@ -335,6 +357,7 @@ class TestParseInstructionAutoLongPath:
         assert mock_split.call_args.kwargs["max_sentences"] == 5
         assert mock_split.call_args.kwargs["max_phases"] == 5
         assert mock_split.call_args.kwargs["max_words"] == 120
+        assert mock_split.call_args.kwargs["target_min_words"] == 60
         assert mock_llm.call_count == 2
         assert all(call.kwargs["fallback_to_rules"] for call in mock_llm.call_args_list)
         mock_post.assert_called_once()
@@ -548,8 +571,90 @@ class TestParseInstructionAutoLongPath:
         assert mock_llm.call_count == 3
         assert mock_llm.call_args_list[-1].args[0] == text
 
+    @patch("vln_instruction_parser.parser._run_global_postprocess")
+    @patch("vln_instruction_parser.llm.split_instruction_semantically")
+    @patch("vln_instruction_parser.parser.parse_instruction_llm")
+    def test_long_path_parses_coalesced_segments_not_raw_fragments(
+        self, mock_llm, mock_split, mock_post
+    ):
+        def sentence(index):
+            label = f"route{chr(ord('a') + index - 1)}"
+            return " ".join([label] + ["detail"] * 19) + "."
+
+        sentences = [sentence(i) for i in range(1, 7)]
+        text = " ".join(sentences)
+        mock_split.return_value = sentences
+        mock_llm.return_value = {
+            "status": "ok", "confidence": 0.94,
+            "tasks": [{"step_id": 1, "action": "MOVE_FORWARD", "features": []}],
+            "constraints": [], "backtracking": {"step_candidates": []},
+        }
+        mock_post.return_value = {
+            "status": "ok", "confidence": 0.93, "tasks": [],
+            "constraints": [], "backtracking": {"step_candidates": []},
+        }
+
+        parse_instruction_auto(text)
+
+        parsed_texts = [args.args[0] for args in mock_llm.call_args_list]
+        assert parsed_texts == [
+            " ".join(sentences[:3]),
+            " ".join(sentences[3:]),
+        ]
+        mock_post.assert_called_once()
+
+    @patch("vln_instruction_parser.parser._run_global_postprocess")
+    @patch("vln_instruction_parser.llm.split_instruction_semantically")
+    @patch("vln_instruction_parser.parser.parse_instruction_llm")
+    def test_coalesced_segment_candidates_are_lifted_globally(
+        self, mock_llm, mock_split, mock_post
+    ):
+        def sentence(index):
+            label = f"route{chr(ord('a') + index - 1)}"
+            return " ".join([label] + ["detail"] * 19) + "."
+
+        sentences = [sentence(i) for i in range(1, 7)]
+        text = " ".join(sentences)
+        mock_split.return_value = sentences
+        mock_llm.side_effect = [
+            {
+                "status": "ok", "confidence": 0.92,
+                "tasks": [{"step_id": 1, "action": "TURN", "direction": "left", "features": []}],
+                "constraints": [],
+                "backtracking": {"step_candidates": [{
+                    "step_id": 1,
+                    "candidates": [{"rank": 2, "step_id": 1, "action": "TURN", "direction": "right", "features": [], "confidence": 0.87}],
+                }]},
+            },
+            {
+                "status": "ok", "confidence": 0.95,
+                "tasks": [{"step_id": 1, "action": "STOP", "features": []}],
+                "constraints": [], "backtracking": {"step_candidates": []},
+            },
+        ]
+        mock_post.return_value = {
+            "status": "ok", "confidence": 0.93, "tasks": [],
+            "constraints": [], "backtracking": {"step_candidates": []},
+        }
+
+        parse_instruction_auto(text)
+
+        plans = mock_post.call_args.args[1]
+        assert [call.args[0] for call in mock_llm.call_args_list] == [
+            " ".join(sentences[:3]),
+            " ".join(sentences[3:]),
+        ]
+        assert len(plans) == 2
+        assert plans[1]["tasks"][0]["step_id"] == 1
+        assert plans[1]["tasks"][0]["direction"] == "right"
+        assert plans[1]["tasks"][1]["step_id"] == 2
+
 
 class TestSemanticSegmentHelpers:
+    @staticmethod
+    def _words(label, count):
+        return " ".join([label] + ["detail"] * (count - 1))
+
     def test_valid_segments_require_original_order_and_five_sentence_limit(self):
         sentences = [f"Move {i}." for i in range(1, 7)]
         text = " ".join(sentences)
@@ -576,6 +681,79 @@ class TestSemanticSegmentHelpers:
             max_phases=5,
             max_words=8,
         )
+
+    def test_coalesce_recombines_fragments_without_creating_short_tail(self):
+        counts = [59, 53, 56, 36, 52, 36, 39, 25, 36, 29]
+        segments = [self._words(f"s{i}", count) for i, count in enumerate(counts)]
+
+        result = _coalesce_semantic_segments(
+            segments, max_sentences=5, max_phases=5, max_words=120,
+            target_min_words=60,
+        )
+
+        assert result == [
+            " ".join(segments[0:2]),
+            " ".join(segments[2:4]),
+            " ".join(segments[4:6]),
+            " ".join(segments[6:8]),
+            " ".join(segments[8:10]),
+        ]
+
+    def test_coalesce_avoids_greedy_short_tail(self):
+        segments = [
+            self._words("a", 39),
+            self._words("b", 25),
+            self._words("c", 36),
+            self._words("d", 29),
+        ]
+        result = _coalesce_semantic_segments(
+            segments, max_sentences=5, max_phases=5, max_words=120,
+            target_min_words=60,
+        )
+        assert result == [
+            " ".join(segments[:2]),
+            " ".join(segments[2:]),
+        ]
+
+    def test_coalesce_preserves_boundaries_between_sufficient_segments(self):
+        segments = [self._words("left", 60), self._words("right", 60)]
+        result = _coalesce_semantic_segments(
+            segments, max_sentences=5, max_phases=5, max_words=120,
+            target_min_words=60,
+        )
+        assert result == segments
+
+    def test_coalesce_keeps_short_segment_when_word_budget_blocks_merge(self):
+        segments = [self._words("long", 100), self._words("tail", 25)]
+        result = _coalesce_semantic_segments(
+            segments, max_sentences=5, max_phases=5, max_words=120,
+            target_min_words=60,
+        )
+        assert result == segments
+
+    def test_coalesce_respects_sentence_and_phase_budgets(self):
+        sentence_segments = [
+            "Move near the hallway. Stop by the wall.",
+            "Turn near the desk. Wait beside it.",
+        ]
+        assert _coalesce_semantic_segments(
+            sentence_segments, max_sentences=3, max_phases=5, max_words=120,
+            target_min_words=60,
+        ) == sentence_segments
+
+        phase_segments = ["Walk forward and turn left.", "Move forward and stop."]
+        assert _coalesce_semantic_segments(
+            phase_segments, max_sentences=5, max_phases=2, max_words=120,
+            target_min_words=60,
+        ) == phase_segments
+
+    def test_coalesce_preserves_contiguous_source_text(self):
+        segments = ["Walk forward.", "Turn left.", "Stop."]
+        result = _coalesce_semantic_segments(
+            segments, max_sentences=5, max_phases=5, max_words=120,
+            target_min_words=60,
+        )
+        assert " ".join(result) == " ".join(segments)
 
     def test_merge_segment_results_preserves_constraints_and_lifts_candidates(self):
         plans = _merge_segment_results_into_plans([

@@ -714,9 +714,11 @@ SEMANTIC_SEGMENTER_SYSTEM_PROMPT = """You partition long 2D navigation instructi
 Rules:
 - Return contiguous excerpts from the original instruction only: do not rewrite, omit, duplicate, or reorder words.
 - Keep execution order unchanged.
+- Prefer fewer complete segments over splitting each sentence into its own segment.
 - Prefer boundaries between completed navigation phases.
 - Keep an antecedent together with references such as this path, that painting, those tiles, or those chairs whenever possible.
 - Keep a condition together with the action it governs, such as until/before/after/then clauses.
+- Prefer keeping movement toward or past a landmark with the immediately following turn or stop at that landmark.
 - Every segment must remain within all requested sentence, navigation-phase, and word budgets.
 - Split within a long sentence at a natural clause or completed navigation-phase boundary when its budgets require it.
 
@@ -798,6 +800,7 @@ def _build_semantic_segmenter_prompt(
     max_sentences: int,
     max_phases: int,
     max_words: int,
+    target_min_words: int,
 ) -> str:
     return '\n'.join([
         f'Original instruction: "{instruction}"',
@@ -806,8 +809,12 @@ def _build_semantic_segmenter_prompt(
         f'- {max_sentences} sentences',
         f'- {max_phases} recognizable navigation action phases',
         f'- {max_words} English words',
+        f'Aim for at least {target_min_words} English words per segment whenever possible without exceeding these maximums.',
+        'Use as few complete segments as the maximum budgets permit; do not split one sentence per segment by default.',
         'Preserve the exact original wording and punctuation in the segments.',
         'Keep references and their navigation context together where the size limit permits.',
+        'Prefer keeping movement to a landmark with an immediately following turn or stop governed by that landmark.',
+        'Keep a shorter segment only when merging it with a neighbor would exceed a maximum budget or break necessary execution context.',
         'For a long single sentence, split only at coherent clause or navigation-phase boundaries.',
         'Return ONLY JSON: {"segments": ["...", "..."]}',
     ])
@@ -818,6 +825,7 @@ def split_instruction_semantically(
     max_sentences: int = 5,
     max_phases: int = 5,
     max_words: int = 120,
+    target_min_words: int = 60,
     **overrides: Any,
 ) -> Optional[List[str]]:
     """Ask the configured LLM to divide a long instruction into coherent excerpts."""
@@ -831,6 +839,7 @@ def split_instruction_semantically(
         max_sentences=max_sentences,
         max_phases=max_phases,
         max_words=max_words,
+        target_min_words=target_min_words,
     )
     if cfg["backend"] == "local":
         result = _call_local(

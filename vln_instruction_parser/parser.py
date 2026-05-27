@@ -21,6 +21,7 @@ LOW_CONFIDENCE_MARGIN = 0.20
 MAX_SEGMENT_SENTENCES = 5
 DEFAULT_SEGMENT_MAX_PHASES = 5
 DEFAULT_SEGMENT_MAX_WORDS = 120
+DEFAULT_SEGMENT_TARGET_MIN_WORDS = 60
 _FIDELITY_BLOCKING_REASONS = {
     "missing_action",
     "extra_action",
@@ -155,6 +156,7 @@ def parse_instruction_auto(
     max_sentences = _sentence_split_threshold()
     max_phases = _segment_max_phases()
     max_words = _segment_max_words()
+    target_min_words = _segment_target_min_words(max_words)
 
     # Short path: unified full-instruction parse
     if not _exceeds_segment_budget(
@@ -191,6 +193,7 @@ def parse_instruction_auto(
         max_sentences=max_sentences,
         max_phases=max_phases,
         max_words=max_words,
+        target_min_words=target_min_words,
         base_url=base_url,
         model=model,
     )
@@ -205,8 +208,16 @@ def parse_instruction_auto(
             text, vote_count, base_url, model, temperature
         )
 
+    segments = _coalesce_semantic_segments(
+        segments or [],
+        max_sentences=max_sentences,
+        max_phases=max_phases,
+        max_words=max_words,
+        target_min_words=target_min_words,
+    )
+
     segment_results: List[Dict[str, Any]] = []
-    for segment in segments or []:
+    for segment in segments:
         result = parse_instruction_llm(
             segment,
             fallback_to_rules=True,
@@ -275,6 +286,14 @@ def _segment_max_words() -> int:
     if parsed is None:
         return DEFAULT_SEGMENT_MAX_WORDS
     return min(parsed, DEFAULT_SEGMENT_MAX_WORDS)
+
+
+def _segment_target_min_words(max_words: int) -> int:
+    """Return the soft target minimum segment length within the active word cap."""
+    parsed = _parse_positive_int(os.environ.get("VLN_SEGMENT_TARGET_MIN_WORDS"))
+    if parsed is None:
+        parsed = DEFAULT_SEGMENT_TARGET_MIN_WORDS
+    return min(parsed, max_words)
 
 
 def _parse_positive_int(raw: Optional[str]) -> Optional[int]:
@@ -348,6 +367,59 @@ def _valid_semantic_segments(
         )
         for segment in segments
     )
+
+
+def _coalesce_semantic_segments(
+    segments: List[str],
+    max_sentences: int,
+    max_phases: int,
+    max_words: int,
+    target_min_words: int,
+) -> List[str]:
+    """Merge adjacent short excerpts into the best budget-compliant grouping.
+
+    The LLM proposes candidate boundaries. This deterministic pass only removes
+    boundaries, minimizing undersized output segments without rewriting text.
+    """
+    if not segments:
+        return []
+
+    # Each DP entry is (score, optimized suffix). Score order is:
+    # short segment count, total word deficit, negative segment count, cut points.
+    best: List[Optional[tuple]] = [None] * (len(segments) + 1)
+    best[-1] = ((0, 0, 0, ()), [])
+
+    for start in range(len(segments) - 1, -1, -1):
+        best_at_start: Optional[tuple] = None
+        for end in range(start + 1, len(segments) + 1):
+            combined = " ".join(segments[start:end])
+            if _exceeds_segment_budget(
+                combined,
+                max_sentences=max_sentences,
+                max_phases=max_phases,
+                max_words=max_words,
+            ):
+                break
+
+            suffix = best[end]
+            if suffix is None:
+                continue
+            suffix_score, suffix_segments = suffix
+            words = _instruction_word_count(combined)
+            short_count = 1 if words < target_min_words else 0
+            deficit = max(0, target_min_words - words)
+            score = (
+                short_count + suffix_score[0],
+                deficit + suffix_score[1],
+                -1 + suffix_score[2],
+                (end,) + suffix_score[3],
+            )
+            option = (score, [combined] + suffix_segments)
+            if best_at_start is None or score < best_at_start[0]:
+                best_at_start = option
+        best[start] = best_at_start
+
+    return best[0][1] if best[0] is not None else list(segments)
 
 
 def _merged_result_requires_whole_parse(result: Dict[str, Any]) -> bool:
